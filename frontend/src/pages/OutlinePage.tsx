@@ -146,6 +146,9 @@ type CoverageUnit = {
   taught_fact_count?: number;
   /** R55 B：这一节内容基本都在图里（系统读不到图）→ 没出内容（原因不同、下一步不同） */
   figure_unavailable?: boolean;
+  /** **R77 补充**：剔了几道"没营养的题"（问页码/目录/版本/版式…）＋一句人话说明 */
+  low_value_dropped?: number;
+  low_value_note_zh?: string;
   /** **R77**：前置章（只读不练）—— 有讲解、没有练习题是对的（别算成"还没内容"） */
   front_matter?: boolean;
   /** R42 B4：章内该节级依据（R40 §2-3 提升项） */
@@ -2208,6 +2211,19 @@ export default function OutlinePage() {
                                 <span className="badge"
                                       title="题目的依据引文在教材里查不到；按「不编造」的规矩没有采用">
                                   {n} 道题没采用
+                                </span>
+                              );
+                            })()}
+                            {/* **R77 补充**：拦掉的"没营养的题"也要看得见（问页码/目录/版本/版式…） */}
+                            {(() => {
+                              const c = contentOf(u.id);
+                              const n = c?.low_value_dropped ?? 0;
+                              if (!n) return null;
+                              return (
+                                <span className="badge deferred"
+                                      title={c?.low_value_note_zh
+                                        || "这些题问的是页码/目录/版本/版式这类「书本身」的东西，换一本书就答不出来——已剔除"}>
+                                  剔除 {n} 道没营养的题
                                 </span>
                               );
                             })()}

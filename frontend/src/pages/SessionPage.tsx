@@ -262,6 +262,19 @@ export default function SessionPage() {
     }
   };
 
+  /** **R77 补充**：做题答不出来 → 手动回讲解（**不算答错**，不影响连对与进度）。
+   *  回去之后把讲解滚到顶部 —— 本项目踩过"点了像没反应"的坑，所以这里显式滚一次
+   *  （窗口与主栏都滚，兼容两种滚动布局；两处都滚不会出错）。 */
+  const rewindToExplain = async () => {
+    await act("rewind_explain");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    try {
+      document.querySelector(".session-main")?.scrollTo({ top: 0, behavior: "smooth" });
+    } catch {
+      /* 忽略：滚动失败不影响"回到讲解"本身 */
+    }
+  };
+
   if (loading && !resp) return <div className="card">加载会话…</div>;
   if (error) return <div className="card error">会话不可用：{error} <button onClick={() => nav("/")}>回仪表盘</button></div>;
   if (!resp) return null;
@@ -430,6 +443,15 @@ export default function SessionPage() {
                 连续答对 {progress?.consecutive_correct ?? 0} / {progress?.target ?? 3} · 本轮已出 {progress?.issued ?? 0} 题
               </div>
               <ExercisePanel exercise={exercise} disabled={submitting} feedback={feedback} onSubmit={submitAnswer} draftPrefix={sidNow} />
+              {/* **R77 补充**：答不出来可以回讲解（用户点名要的）。放主按钮旁边、不抢主按钮位；
+                  旁边直接点明"不算答错"，别让人以为这是在放弃/交白卷。 */}
+              <div style={{ marginTop: 10 }}>
+                <button className="ghost" disabled={submitting} onClick={() => void rewindToExplain()}
+                        title="回到讲解从头看一遍：这一步不算答错，不影响你的连对与进度；当前这题还在，看完可以接着做">
+                  答不出来？回去看讲解
+                </button>{" "}
+                <span className="dim" style={{ fontSize: 12 }}>不算答错，不影响连对与进度</span>
+              </div>
             </div>
           )}
           {step === "feynman" && (
