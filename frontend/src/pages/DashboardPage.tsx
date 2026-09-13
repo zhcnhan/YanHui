@@ -74,6 +74,10 @@ export default function Dashboard() {
   const nav = useNavigate();
   const [dash, setDash] = useState<DashboardData | null>(null);
   const [subjects, setSubjects] = useState<SubjectRow[]>([]);
+  // 2026-09-13（用户实测）：数学停用了，可"自动接着生成下一个主题"这块**照样显示**，
+  // 而且写的是"小学 · 图形与几何"——那是**数学预设的学段**，跟用户当时在看的学科毫无关系。
+  // 这块本来就只属于数学预设（内容自续/五学段 roadmap），所以：**数学没启用就不显示**。
+  const mathEnabled = subjects.some((s) => s.id === "math" && s.enabled);
   const [graph, setGraph] = useState<GraphData | null>(null);
   const [campaign, setCampaign] = useState<CampaignData | null>(null);
   const [sx, setSx] = useState<SelfExtendStatus | null>(null);
@@ -405,7 +409,7 @@ export default function Dashboard() {
             </>
           )}
 
-          {sx && sx.active_level && (
+          {sx && sx.active_level && mathEnabled && (
             <Collapsible
               id="home-selfextend"
               title="自动接着生成下一个主题"
