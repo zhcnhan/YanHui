@@ -123,6 +123,10 @@ def new_flow() -> dict[str, Any]:
             "streak": 0,
             "streak_min": None,
             "attempts_this": 0,
+            # 2026-09-13：跨题"连续答错"计数（答对归零、换题不归零）。
+            # 为什么另开一个：`attempts_this` 每换一题就被 `_issue_next` 归零，
+            # 所以"同一题错两次"这套判据在**换题**的路径（图示教材模式）上永远到不了。
+            "consecutive_wrong": 0,
             "hints_this": 0,
             "current": None,  # {"exercise_id", "seed"}
             "passed": False,
@@ -166,6 +170,7 @@ _PRACTICE_SHAPE: dict[str, tuple[type, ...]] = {
     "streak": (int,),
     "streak_min": (int, float, type(None)),
     "attempts_this": (int,),
+    "consecutive_wrong": (int,),
     "hints_this": (int,),
     "current": (dict, type(None)),
     "passed": (bool,),
@@ -686,6 +691,7 @@ class SessionService:
                                  "score_0_1": float(out.get("score_0_1") or 0.0)}
         if correct:
             p["attempts_this"] = 0
+            p["consecutive_wrong"] = 0
             p["streak"] += 1
             p["streak_min"] = (float(cur.difficulty) if p["streak_min"] is None
                                else min(p["streak_min"], float(cur.difficulty)))
@@ -712,16 +718,21 @@ class SessionService:
         p["streak"] = 0
         p["streak_min"] = None
         p["attempts_this"] += 1
+        p["consecutive_wrong"] = int(p.get("consecutive_wrong") or 0) + 1
         events.append({"type": "exercise_wrong", "retry_left": max(0, 2 - p["attempts_this"])})
-        if p["attempts_this"] >= 2:
-            # 两次判错 → 回炉看讲解（本模式直接回讲解阶段；讲解就是本单元的正文）
-            sess.flow_json["stage"] = STAGE_EXPLAIN
-            sess.flow_json["explained_seen"] = False
-            p["attempts_this"] = 0
-            events.append({"type": "relearn_explain"})
-        else:
-            self._issue_next(db, sess, node)
-            events.append({"type": "question_issued"})
+        # **2026-09-13 修（Euler 报的真缺陷，架构侧实测复现）**：
+        # 这条路上 `attempts_this` **永远到不了 2** —— 第一次判错就 `_issue_next` 换新题，
+        # 而 `_issue_next` 会把 `attempts_this` 归零 ⇒ 上面那条"错两次回炉"在这条路上走不到，
+        # 学生连续答错几题都见不到讲解。但"模型判题更贵、第一次错就换题"是本模式的合理设计，
+        # 不该改 ⇒ **另用一个跨题计数**：连续答错 2 题就回炉看讲解（答对一题即重新计数）。
+        # 口径：`partial`（答对一部分）**既不算错也不算对**——不加这个计数，也不清零。
+        if p["attempts_this"] >= 2 or p["consecutive_wrong"] >= 2:
+            # 回炉看讲解（本模式直接回讲解阶段；讲解就是本单元的正文）
+            self._relearn_explain(db, sess, node, events)
+            events.append({"type": "practice_retry_exhausted"})
+            return self._response(db, sess, events=events)
+        self._issue_next(db, sess, node)
+        events.append({"type": "question_issued"})
         extra["progress"] = self._progress_view(p)
         return self._response(db, sess, events=events, extra_payload=extra)
 
@@ -729,7 +740,14 @@ class SessionService:
         p = sess.flow_json["practice"]
         cur = self._require_current(sess, node)
         ex_id = payload.get("exercise_id")
-        if ex_id != cur.exercise_id or int(payload.get("params_seed", -1)) != cur.seed:
+        # 2026-09-13：`params_seed` 缺失/为 null 时，原来直接 int(None) → **500**。
+        # 这不是"题目对不上"，而是"提交的形状不对"——用 `or -1` 落回校验，
+        # 让它走 409 的中文提示，而不是抛类型错的 500。
+        try:
+            seed_got = int(payload.get("params_seed") or -1)
+        except (TypeError, ValueError):
+            seed_got = -1
+        if ex_id != cur.exercise_id or seed_got != cur.seed:
             raise SessionError("提交的题目与当前题目不一致，请刷新", code="invalid_state")
         user_answer = str(payload.get("user_answer", "")).strip()
 
@@ -760,6 +778,7 @@ class SessionService:
         events: list[dict] = []
         if result.correct:
             p["attempts_this"] = 0
+            p["consecutive_wrong"] = 0
             p["streak"] += 1
             p["streak_min"] = float(cur.difficulty) if p["streak_min"] is None else min(p["streak_min"], float(cur.difficulty))
             events.append({"type": "exercise_correct", "node_id": node.id, "consecutive_correct": p["streak"]})
@@ -793,6 +812,9 @@ class SessionService:
             ),
             strategy=hint_decision.strategy,
         )
+        # 2026-09-13：这里只**维护**计数（与图示教材模式同一个含义：答对归零、答错累加），
+        # **判据一个字没改**——文字教材路径本来就是"同一题错两次回炉"（下一行那句）。
+        p["consecutive_wrong"] = int(p.get("consecutive_wrong") or 0) + 1
         if p["attempts_this"] >= 2:
             # 仍错 → 讲解回炉 + 答疑（docs/05 §2）
             self._relearn_explain(db, sess, node, events)
