@@ -528,10 +528,23 @@ export default function SessionPage() {
                 {submitting ? "♻️ 换题中…" : "🔄 换新题（已纠错替换）"}
               </button>
             )}
-            {step === "practice" && payload.verdict === "wrong" && !exercise?.interactive.includes("guided") && (
-              <button className="ghost" disabled={submitting} onClick={() => act("request_hint", { exercise_id: exercise?.exercise_id, user_answer: "" })}>
-                要提示
+            {/* 2026-09-13 修（用户实测：「那个看提示功能根本没卵用」）：
+                原来这里是 `payload.verdict === "wrong"` —— **答错之后才出现按钮**，
+                未作答时连入口都没有；而后端当时也要求"必须先答错一次"，于是这个功能等于没有。
+                现在：**只要在做题就显示**（guided 引导题除外，它本来就一步步带），
+                答错前后只是**文案不同**：没作答=「要提示」，答错了=「看看我错在哪」。 */}
+            {step === "practice" && !exercise?.interactive.includes("guided") && (
+              <button className="ghost" disabled={submitting}
+                      title="只给方向，不给答案；要提示不算答错，不影响连对与进度"
+                      onClick={() => act("request_hint", {
+                        exercise_id: exercise?.exercise_id,
+                        user_answer: payload.verdict === "wrong" ? (payload.message as string) ?? "" : "",
+                      })}>
+                {payload.verdict === "wrong" ? "看看我错在哪" : "要提示"}
               </button>
+            )}
+            {step === "practice" && !exercise?.interactive.includes("guided") && (
+              <span className="dim" style={{ fontSize: 12 }}>（只给方向，不给答案）</span>
             )}
             {(step === "explain" || step === "practice" || step === "feynman") && (
               <button className="ghost" disabled={submitting} onClick={async () => { await act("finish"); }}>

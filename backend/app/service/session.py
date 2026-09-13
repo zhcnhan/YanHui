@@ -548,20 +548,38 @@ class SessionService:
         )
 
     def _act_hint(self, db: Session, sess: models.Session, node: NodeDoc, payload: dict[str, Any]) -> dict[str, Any]:
+        """**要提示**：本题开着就能要，**不必先答错**。
+
+        2026-09-13 修（用户实测：「那个看提示功能根本没卵用」）：
+        以前这里要求 `attempts_this >= 1`（必须先答错一次），未作答时直接报
+        「提示只能在本题首次答错后请求（请先作答一次）」——于是**按钮全程可见、点了必被拒**。
+
+        但**光删掉那个前提是不够的**：提示词 `U_HINT` 原本是"帮助学生发现自己的错误"，
+        输入里有「学生作答」「判题细节」。未作答时这两项是空的，模型会**硬猜一个并不存在的错误**。
+        所以这里按"有没有作答过"分两种，把两个输入字段换成**明确的中文说明**（不是空串），
+        提示词照着这个说明分别处理。
+        """
         p = sess.flow_json["practice"]
-        if p["current"] is None or p["attempts_this"] < 1:
-            raise SessionError("提示只能在本题首次答错后请求（请先作答一次）", code="invalid_state")
+        if p["current"] is None:
+            raise SessionError("现在没有正在做的题，先开始一道题再要提示", code="invalid_state")
         ex_id = payload.get("exercise_id")
         if ex_id and ex_id != p["current"]["exercise_id"]:
             raise SessionError("exercise_id 与当前题目不符", code="validation_error")
         cur = self._render_current(sess, node)
-        detail = payload.get("judge_detail", "")
+        attempted = int(p.get("attempts_this") or 0) >= 1
+        if attempted:
+            student_answer = str(payload.get("user_answer", ""))
+            judge_detail = str(payload.get("judge_detail", "") or "")
+        else:
+            # 还没作答：明说"没有作答、没有错误"，别让模型去猜
+            student_answer = "（还没有作答）"
+            judge_detail = "（还没有作答，所以没有判错信息；不要假设学生错了，也不要写「你刚才错在…」）"
         ctx = HintOnErrorIn(
             node_id=node.id,
             prompt=cur.prompt,
             mode=cur.mode,
-            user_answer=str(payload.get("user_answer", "")),
-            judge_detail=detail,
+            user_answer=student_answer,
+            judge_detail=judge_detail,
         )
         decision = self._resolve_tier(db, node=node, override=payload.get("think_deep"), call_name="hint_on_error")
         out, degraded = self._call(db, self.gateway.hint_on_error, ctx, strategy=decision.strategy)
@@ -570,8 +588,9 @@ class SessionService:
         return self._response(
             db,
             sess,
-            events=[{"type": "hint_given", "count": p["hints_this"]}],
-            extra_payload={"hint_md": out.hint_md, "degraded": degraded, "strategy": decision.strategy},
+            events=[{"type": "hint_given", "count": p["hints_this"], "attempted": attempted}],
+            extra_payload={"hint_md": out.hint_md, "degraded": degraded,
+                           "strategy": decision.strategy, "after_attempt": attempted},
         )
 
     def _subject_is_all_ai(self, db: Session, node: NodeDoc) -> bool:
