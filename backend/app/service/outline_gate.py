@@ -270,6 +270,35 @@ def subject_node_allowed(db: Session, user_id: str, node_id: str) -> bool:
 MIN_EXERCISES = 1
 MIN_EXPLANATION_CHARS = 1
 
+# **R77 前置章**：这类章节（凡例/前言/目录/序/致谢/索引）**只读不练** —— 有讲解、没有题是对的。
+FRONT_MATTER_NOTE_ZH = ("这一章是前置内容（凡例/前言/目录这类）：只出讲解，不出题、也没有费曼复盘。")
+
+
+def is_front_matter(node_id: str, node=None) -> bool:
+    """这个单元是不是**前置章**（凡例/前言/目录…）：只读不练。
+
+    判据**两条取或**（两条都查，少查一条就会出故障）：
+
+    ① **内容节点**上写着 `front_matter: true`（生成时由单元标记写进节点）——
+       兜住"正文章改成前置章"：题还在文件里，但不再出题、不进费曼；
+    ② **大纲单元**的 `meta.front_matter` —— 用户在界面上翻的就是它。
+       兜住"前置章改成正文章"：旧节点还没有题，不能因为标记翻了就去调 `_issue_next`
+       （那会撞"没有可用练习"）。
+    """
+    if node is None:
+        loaded = get_library().by_id.get(node_id)
+        node = loaded.doc if loaded is not None else None
+    if node is not None and bool(getattr(node, "front_matter", False)):
+        return True
+    head, sep, _ = str(node_id).partition(".")
+    if not sep:
+        return False
+    outline = _outline_of(head)
+    unit = outline.by_id().get(node_id) if outline is not None else None
+    if unit is None:
+        return False
+    return bool((getattr(unit, "meta", None) or {}).get("front_matter"))
+
 
 def unit_content_status(node_id: str) -> dict:
     """单元内容可用性（内容文件口径；不读账本、不猜）。
@@ -286,7 +315,9 @@ def unit_content_status(node_id: str) -> dict:
            "missing": "content", "explanation_chars": 0, "exercises": 0, "taught_facts": 0,
            "asks": 0, "dropped_exercises": 0, "title": "",
            # R55 B：内容基本都在图里而没出稿（与覆盖账同源）
-           "figure_unavailable": False}
+           "figure_unavailable": False,
+           # **R77**：这一章是不是前置章（只读不练）——界面据此标"前置章 · 只读不练"
+           "front_matter": False}
     # 覆盖记录（同源：大纲单元的覆盖记录）——**先读**，因为"整节靠图 → 没出稿"的单元
     # 根本不在内容库里，只有覆盖记录说得清原因。
     subject_id = None
@@ -320,6 +351,10 @@ def unit_content_status(node_id: str) -> dict:
                 "explanation_chars": len(explanation), "exercises": exercises,
                 "taught_facts": facts, "asks": asks})
     dropped_facts = int(out.get("dropped_facts") or 0)
+    # **R77**：前置章有讲解、**没有题是对的** —— 账要如实（有讲解、无练习），
+    # 但**不许**把它算成"还没内容/不可学"（那样用户点进去会被守卫拦住，等于白生成）。
+    front = is_front_matter(node_id, doc)
+    out["front_matter"] = front
     if not explanation and not exercises:
         # **R55 B**：这一节的内容基本都在图里（系统读不到图）→ 说清**真正的原因**，
         # 不能只说"还没有内容"（那会让人以为是漏生成，反复点生成也是白点）。
@@ -330,6 +365,8 @@ def unit_content_status(node_id: str) -> dict:
                         "reason_zh": "这个单元还没有讲解和练习，先生成内容才能开始学"})
     elif not explanation:
         out.update({"missing": "explanation", "reason_zh": "这个单元还没有讲解正文，先生成讲解才能开始学"})
+    elif front:
+        out.update({"usable": True, "missing": "", "reason_zh": FRONT_MATTER_NOTE_ZH})
     elif exercises < MIN_EXERCISES:
         out.update({"missing": "exercise",
                     "reason_zh": "这个单元还没有可用的练习题（题目可能因为找不到教材依据被丢弃了），"
@@ -346,6 +383,8 @@ def unit_content_status(node_id: str) -> dict:
 
 
 __all__ = [
+    "FRONT_MATTER_NOTE_ZH",
+    "is_front_matter",
     "resolve_subject_unit",
     "unit_allowed",
     "node_allowed",

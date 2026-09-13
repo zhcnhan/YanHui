@@ -219,18 +219,26 @@ class NodeDoc(BaseModel):
     exercises: list[ExerciseDoc] = Field(default_factory=list)
     feynman: FeynmanDoc
     exercises: list[ExerciseDoc] = Field(default_factory=list)
+    # **R77 前置章**（凡例/前言/目录/序/致谢/索引…）：**只读不练**——讲解照旧生成，
+    # 但不出题、不进费曼（拿"这本书是谁辑的"考学生是版本学，不是学这门手艺）。
+    # 由单元 `meta.front_matter` 在生成时写进节点；旧节点没有这个键 → 默认 false（一个都不受影响）。
+    front_matter: bool = False
     # R35 S1：声明式知识包（旧内容可缺省；缺省者**不阻塞加载**，但不得通过可答性校验）
     taught_facts: list[TaughtFact] = Field(default_factory=list)
     derivable: list[Derivable] = Field(default_factory=list)
     # 正文（front-matter 之后的全部 Markdown）
     body_md: str = ""
 
-    @field_validator("exercises")
-    @classmethod
-    def _need_exercises(cls, v: list[ExerciseDoc]) -> list[ExerciseDoc]:
-        if not v:
+    @model_validator(mode="after")
+    def _need_exercises(self) -> "NodeDoc":
+        """每个节点至少 1 道练习 —— **前置章除外**（R77）。
+
+        放宽的判据是**节点上的标记**（`front_matter`，生成时由单元写进来），不是猜：
+        正文章一道题都不许少（这里只是放行前置章那一条）。
+        """
+        if not self.exercises and not self.front_matter:
             raise ValueError("每个节点至少 1 道练习（学习闭环需自动判题环节）")
-        return v
+        return self
 
     def explain_prompt(self) -> str:
         return self.explanation.body

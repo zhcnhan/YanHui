@@ -2393,6 +2393,8 @@ def coverage_ledger(db, subject_id: str) -> dict:
             "content_reason_zh": str(content.get("reason_zh") or ""),
             "exercise_count": int(content.get("exercises") or 0),
             "taught_fact_count": int(content.get("taught_facts") or 0),
+            # **R77**：前置章（凡例/前言/目录…）—— 有讲解、没题是**正常的**，界面按这个标
+            "front_matter": bool(content.get("front_matter")),
             # **R55 B**：这一节的内容基本都在图里（系统读不到图）→ 没出内容；
             # 与"还没生成"区分开（原因不同、下一步不同），界面上单独标出来。
             "figure_unavailable": bool(cov.get("figure_unavailable")),

@@ -481,10 +481,18 @@ class SessionService:
             flow["stage"] = STAGE_EXAMPLE
             return self._response(db, sess, events=[{"type": "stage_example"}])
         if stage == STAGE_EXAMPLE:
+            # **R77 前置章**：没有题 —— 讲解/例题看完就完成，**不排练习**（不调 `_issue_next`）。
+            if self._is_front_matter(node):
+                self._front_matter_complete(db, sess, node)
+                return self._response(db, sess, events=[{"type": "front_matter_done"}])
             flow["stage"] = STAGE_PRACTICE
             self._issue_next(db, sess, node)
             return self._response(db, sess, events=[{"type": "stage_practice"}])
         if stage == STAGE_PRACTICE:
+            # **R77**：前置章（例如刚被用户从"正文章"改成"前置章"）不许再出题
+            if self._is_front_matter(node):
+                self._front_matter_complete(db, sess, node)
+                return self._response(db, sess, events=[{"type": "front_matter_done"}])
             # 练习中不允许"跳过"；仅回炉后重进用 next 返回练习
             if not flow["practice"]["passed"] and flow["practice"]["current"] is None:
                 self._issue_next(db, sess, node)
@@ -801,6 +809,9 @@ class SessionService:
           复评一次，取两次较高者并入账本（防"同一篇讲解这次过、下次不过"的阈值抖动）。
         """
         flow = sess.flow_json = _ensure_flow_shape(sess.flow_json)  # R29 引申：进费曼前再自愈一次
+        # **R77 前置章**：没有费曼复盘 —— 用户手动提交也**不调模型**，只给一句中文说明。
+        if self._is_front_matter(node):
+            return self._front_matter_refuse_feynman(db, sess, node)
         p = flow["practice"]
         f = flow["feynman"]
         # **R54 A**：没看过讲解就不许开讲（用户实测场景）——不报错，直接把人送回讲解。
@@ -1013,6 +1024,9 @@ class SessionService:
         - 预算 ≤2；同一缺口答不对 → 缺口保留、可再追一次；额度尽且无剩余缺口 → review 请求整合终验。
         """
         flow = sess.flow_json = _ensure_flow_shape(sess.flow_json)  # R29 引申：补答前再自愈一次
+        # **R77 前置章**：没有费曼复盘（补答同属费曼环节）→ 只给一句中文说明，不调模型
+        if self._is_front_matter(node):
+            return self._front_matter_refuse_feynman(db, sess, node)
         p = flow["practice"]
         f = flow["feynman"]
         # **R54 A**：没看过讲解就不许补答（同 `_act_feynman`：送回讲解而不是报错）
@@ -1530,8 +1544,58 @@ class SessionService:
     # ------------------------------------------------------------------
     # 内部：费曼/达标
     # ------------------------------------------------------------------
+    def _is_front_matter(self, node: NodeDoc) -> bool:
+        """**R77**：这一章是不是**前置内容**（凡例/前言/目录…）→ 只读不练。
+
+        判据在 `outline_gate.is_front_matter`（节点标记 **或** 单元标记，两条取或）——单一实现。
+        """
+        from . import outline_gate
+
+        return outline_gate.is_front_matter(node.id, node)
+
+    def _front_matter_complete(self, db: Session, sess: models.Session, node: NodeDoc) -> None:
+        """**R77**：前置章"读完就完成"——不出题、不进费曼，但**必须算完成**。
+
+        为什么必须算完成：后面正文章的解锁判据是"前置单元已满足"（`outline_gate.unit_allowed`
+        → 节点 `mastered`）。前置章要是停在半路，整本书后面全锁着打不开。
+
+        不排 FSRS 复习（`schedule_first`）：一张目录/凡例不值得定期提醒你"该复习了"。
+        """
+        flow = sess.flow_json
+        flow["practice"]["passed"] = True          # 练习环节"直接记为已过"（不调 `_issue_next`）
+        flow["stage"] = STAGE_DONE
+        sess.state = "finished"
+        mark_mastered(db, self.user_id, node.id, get_library().graph)   # 幂等
+        db.flush()
+
+    def _front_matter_refuse_feynman(self, db: Session, sess: models.Session, node: NodeDoc,
+                                     events: list[dict] | None = None) -> dict[str, Any]:
+        """**R77**：前置章**不进费曼** —— 一句话说清原因（中文、说人话），**不调模型**。
+
+        为什么要这个出口：前置章的 `practice.passed` 是我们直接置为 True 的，
+        若不显式拦住，用户手动提交一段"口述"就会**真去调用评分模型** —— 那既白花钱，
+        也不符合"这章没有费曼复盘"。
+        """
+        from . import outline_gate
+
+        self._front_matter_complete(db, sess, node)
+        ev = list(events or [])
+        ev.append({"type": "front_matter_no_feynman",
+                   "note_zh": outline_gate.FRONT_MATTER_NOTE_ZH})
+        return self._response(db, sess, events=ev,
+                              extra_payload={"front_matter": True,
+                                             "front_matter_zh": outline_gate.FRONT_MATTER_NOTE_ZH})
+
     def _enter_feynman(self, db: Session, sess: models.Session, node: NodeDoc, events: list[dict]) -> None:
         flow = sess.flow_json
+        # **R77**：前置内容**不进费曼**（用户点名要的）——停在"这一节读完就完成"，并给一句中文说明。
+        if self._is_front_matter(node):
+            from . import outline_gate
+
+            self._front_matter_complete(db, sess, node)
+            events.append({"type": "front_matter_done", "node_id": node.id,
+                           "note_zh": outline_gate.FRONT_MATTER_NOTE_ZH})
+            return
         # R17 防御：进入费曼前若整体稿评分已达上限（历史回炉未清零的会话/数据迁移遗留），
         # 视为新费曼阶段自动清零，避免用户"重学后仍 409 锁死"。
         if self._feynman_eval_rounds(flow["feynman"]) >= MAX_FEYNMAN_EVALS:
@@ -1728,6 +1792,18 @@ class SessionService:
             flow["stage"] = STAGE_EXPLAIN
             stage = STAGE_EXPLAIN
             flow["_rewound_zh"] = "之前没有看过这一节的讲解，已退回讲解：看完再讲一遍就能继续。"
+        if stage in (STAGE_PRACTICE, STAGE_FEYNMAN):
+            # **R77 前置章**：不进练习、不进费曼 —— 老会话、或"学到一半用户把标记改成前置章"，
+            # 都不许把人卡在练习台/费曼台上，也不许去调 `_issue_next`（那会撞"没有可用练习"）。
+            # ⚠️ 节点已不在内容库时**不在这里抛**（那是另一条路：`_response` 会给"缺内容"卡片）。
+            fm_node: NodeDoc | None
+            try:
+                fm_node = self._node_of(db, sess)
+            except SessionError:
+                fm_node = None
+            if fm_node is not None and self._is_front_matter(fm_node):
+                self._front_matter_complete(db, sess, fm_node)
+                stage = flow["stage"]
         if stage == STAGE_PRACTICE and flow["practice"]["current"] is None:
             node = self._node_of(db, sess)
             if flow["practice"]["passed"] and not flow["feynman"]["passed"] and flow.get("explained_seen"):
@@ -1750,6 +1826,17 @@ class SessionService:
         if blocked is not None:
             return self._content_missing_response(db, sess, blocked)
         assert node is not None
+
+        # **R77 前置章**：只读不练 —— 练习 / 费曼这两个环节**一律不下发**，停在"这一节读完就完成"。
+        # 说明原因的那句话随响应一起给（界面直说，不让用户以为"点了没反应"）。
+        if self._is_front_matter(node):
+            from . import outline_gate
+
+            payload["front_matter"] = True
+            payload["front_matter_zh"] = outline_gate.FRONT_MATTER_NOTE_ZH
+            if stage in (STAGE_PRACTICE, STAGE_FEYNMAN):
+                self._front_matter_complete(db, sess, node)
+                stage = flow["stage"]
 
         # R27：费曼账本/预算永远随响应下发（回炉/达标后仍可展示"当时的进度"）
         f = flow.get("feynman") or {}

@@ -348,6 +348,8 @@ def unit_states(
                 "status": satisfied[u.id],
                 "open": open_flags[u.id],
                 "content_ids": sorted(nid for nid, uid in c2u.items() if uid == u.id),
+                # **R77**：前置章（凡例/前言/目录…）—— 学习地图/学科页据此标"只读不练"
+                "front_matter": bool((getattr(u, "meta", None) or {}).get("front_matter")),
                 "prereqs": list(u.prereqs),
             }
         )

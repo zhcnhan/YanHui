@@ -90,6 +90,9 @@ def draft_mode_outline(db, subject_id: str, *, brief: str = "", count: int = 0, 
                       "concept_tags": list(u.concept_tags or []),
                       "group": "教材", "prereqs": ([f"{subject_id}.u{i - 1:02d}"] if i > 1 else []),
                       "difficulty": min(3, max(1, i)), "requires_thinking": False,
+                      # **R77 前置章**：模型说这是"书本身"的内容（凡例/前言/目录…）→ 原样标下来。
+                      # 用户在大纲页上可以改（采纳后那个开关）；默认值就取 AI 的判断。
+                      "meta": ({"front_matter": True} if getattr(u, "is_front_matter", False) else {}),
                       "materials": [{"title": _pages_title(db, subject_id), "section": s}
                                     for s in src] or [{"title": _pages_title(db, subject_id),
                                                        "section": ""}]})
@@ -239,7 +242,9 @@ def generate_mode_unit(db, subject_id: str, unit, *, provider=None, want_count: 
     lesson = mode_ai.lesson(provider, ModeLessonIn(
         unit_title=unit.title, objectives=list(unit.objectives or []), pages_digest=pages),
         subject_id=subject_id, unit_id=unit.id)
-    exercises = mode_ai.exercises(provider, ModeExerciseIn(
+    # **R77 前置章**：讲解**照旧生成**（用户明确要的），但**不出题**——不调 mode_exercise。
+    front = bool((getattr(unit, "meta", None) or {}).get("front_matter"))
+    exercises = None if front else mode_ai.exercises(provider, ModeExerciseIn(
         unit_title=unit.title, key_points=list(lesson.key_points or []), pages_digest=pages,
         want_count=max(1, min(want_count, MAX_AI_EXERCISES)), kind="practice"),
         subject_id=subject_id, unit_id=unit.id)
@@ -255,13 +260,16 @@ def generate_mode_unit(db, subject_id: str, unit, *, provider=None, want_count: 
         return {"status": "failed", "node_id": unit.id, "path": str(path),
                 "note": "；".join(out.errors[:3])}
     return {"status": "created", "node_id": unit.id, "path": str(path),
-            "note": (f"出稿：全 AI 模式（模型写讲解 + 出题，共 {len(doc.exercises)} 题）"
-                     f"；这个模式没有独立的第二次核对"
+            "note": ((f"出稿：全 AI 模式（前置章：只出讲解，不出题）"
+                      if front else
+                      f"出稿：全 AI 模式（模型写讲解 + 出题，共 {len(doc.exercises)} 题）")
+                     + "；这个模式没有独立的第二次核对"
                      + ("；" + note_zh if note_zh else "")),
+            "front_matter": bool(doc.front_matter),
             "source_pages": list(lesson.source_pages or []),
             "read_pages": state["read"], "unread_pages": state["unread"],
             "lesson_uncertain": bool(lesson.uncertain),
-            "exercise_uncertain": bool(exercises.uncertain)}
+            "exercise_uncertain": bool(getattr(exercises, "uncertain", False))}
 
 
 def _record_reason(db, subject_id: str, unit, note: str) -> None:
@@ -289,8 +297,9 @@ def _to_node_doc(subject_id: str, unit, lesson, exercises, subject_label: str = 
     """组装成**与路径②同一种**节点文件（复用 `build_node_doc`：rubric/费曼任务/结构都照旧）。"""
     from .generate import build_node_doc
 
+    front = bool((getattr(unit, "meta", None) or {}).get("front_matter"))
     exs: list[ExerciseDoc] = []
-    for i, e in enumerate(exercises.exercises or [], start=1):
+    for i, e in enumerate(((exercises.exercises if exercises is not None else []) or []), start=1):
         if not str(e.prompt or "").strip() or not str(e.answer or "").strip():
             continue          # 题面或答案不全的题**直接不要**（不许硬凑）
         exs.append(ExerciseDoc(
@@ -301,7 +310,7 @@ def _to_node_doc(subject_id: str, unit, lesson, exercises, subject_label: str = 
                            basis_pages=[str(p) for p in (e.basis_pages or [])],
                            answer_kind=str(e.kind or "")),
             interactive=["workbench"]))
-    if not exs:
+    if not exs and not front:
         from .schemas import OutlineError
 
         raise OutlineError("模型这次没给出可用的题（题面或标准答案缺失）——这些页面可能读不出来，"
@@ -314,16 +323,22 @@ def _to_node_doc(subject_id: str, unit, lesson, exercises, subject_label: str = 
         lecture=str(lesson.lecture_md or "").strip() or "（这一单元暂无讲解）",
         facts=[], derivable=[],
         worked_examples=list(lesson.worked_examples or []), asks=[])
-    note = _boundary_note(lesson, exercises)
+    note = _boundary_note(lesson, exercises, front=front)
     doc.explanation.body = doc.explanation.body.rstrip() + "\n\n" + note
     doc.body_md = doc.body_md.rstrip() + "\n\n" + note
     return doc
 
 
-def _boundary_note(lesson, exercises) -> str:
-    lines = ["## 这个模式要说清的一件事",
-             "讲解与题目都由模型给出，**程序没有替你复核**（没有独立的第二次核对，数学题也一样）；",
-             "依据只能指到「页/图号」，没有逐字原文可查。"]
+def _boundary_note(lesson, exercises, *, front: bool = False) -> str:
+    lines = ["## 这个模式要说清的一件事"]
+    if front:
+        # **R77**：前置章没有题、也没有费曼 —— 这段"诚实边界"必须说实话（不许提"题目/评分"）。
+        lines.append("这一章是**前置内容**（凡例/前言/目录这类）：**只出讲解，不出题、也没有费曼复盘**。")
+        lines.append("讲解由模型给出，**程序没有替你复核**；依据只能指到「页/图号」，没有逐字原文可查。")
+    else:
+        lines.append("讲解与题目都由模型给出，**程序没有替你复核**"
+                     "（没有独立的第二次核对，数学题也一样）；")
+        lines.append("依据只能指到「页/图号」，没有逐字原文可查。")
     if getattr(lesson, "uncertain", False):
         lines.append(f"> 讲解里有不确定的地方：{lesson.uncertain_reason}")
     if getattr(exercises, "uncertain", False):

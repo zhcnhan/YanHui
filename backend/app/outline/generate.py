@@ -266,6 +266,8 @@ def build_node_doc(
     **不再内置"举实例 / 它与你学过的联系"这类模板套话**——那正是被审计判为不可答的写法。
     """
     objectives = list(unit.objectives) or ["理解本单元核心内容"]
+    # **R77 前置章**：单元上标了 `meta.front_matter` → 这个节点只读不练（不出题、不进费曼）。
+    front = bool((getattr(unit, "meta", None) or {}).get("front_matter"))
     lines = [f"# {unit.title}", "", f"【{subject_label or unit.group} · 学习目标】"]
     lines += [f"- {o}" for o in objectives]
     lines += ["", "## 讲解"]
@@ -306,10 +308,11 @@ def build_node_doc(
                              solution_steps=[str(s) for s in ((w or {}).get("solution_steps") or [])])
             for w in (worked_examples or []) if str((w or {}).get("prompt") or "").strip()
         ],
-        exercises=exercises or [ExerciseDoc(
+        # **R77**：前置章**不许**补那道凑数的判断题——它就是"只读不练"，没有题是对的。
+        exercises=exercises or ([] if front else [ExerciseDoc(
             id="judge-min", kind="fixed", difficulty=1,
             prompt="判断题：学完本单元后，你应能用自己的话简要复述主题。",
-            answer_bool=True, check=CheckDoc(mode="boolean_judgment"))],
+            answer_bool=True, check=CheckDoc(mode="boolean_judgment"))]),
         feynman=FeynmanDoc(
             task_prompt=task,
             rubric=rubric,
@@ -320,6 +323,7 @@ def build_node_doc(
         taught_facts=list(facts or []),
         derivable=list(derivable or []),
         body_md=body,
+        front_matter=front,
     )
 
 
@@ -430,6 +434,10 @@ def _frontmatter_md(doc: NodeDoc) -> str:
             "thinking": doc.feynman.thinking,
         },
     }
+    # **R77**：前置章把标记一并落盘（会话层/界面据此"只读不练"）；正文章不写这个键
+    # （旧节点、正文章一个字节都不受影响）。
+    if doc.front_matter:
+        meta["front_matter"] = True
     head = yaml.safe_dump(meta, allow_unicode=True, sort_keys=False, width=100).rstrip()
     return "\n".join(["---", head, "---", "", doc.body_md])
 

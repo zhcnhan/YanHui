@@ -540,6 +540,9 @@ class ModeUnit(BaseModel):
     objectives: list[str] = Field(default_factory=list)
     concept_tags: list[str] = Field(default_factory=list)
     source_pages: list[str] = Field(default_factory=list)   # 依据指到页/图号（本模式没有逐字原文）
+    # **R77 前置章**：书名页/版权页/目录/凡例/序/前言/致谢/索引这类**前置内容** → true。
+    # 声明在 schema 里（pydantic 默认丢未声明字段 → 漏声明会静默失效）。
+    is_front_matter: bool = False
 
 
 class ModeOutlineOut(BaseModel):
