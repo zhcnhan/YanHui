@@ -478,8 +478,17 @@ def _plan_page_reads(files: list[tuple[str, bytes]], *, pdf_pages: str, limit: i
                    for p, label in zip(picked, labels)]
         files = [(it["name"], it["data"]) for it in planned]
         if len(planned) > limit:
-            raise PagePlanError(f"这次要读 {len(planned)} 页，超过上限 {limit} 页——"
-                                f"请把页范围缩小一些，或把上限填大一点")
+            # 2026-09-13 修（用户实测）：原来只说"把页范围缩小一些，或把上限填大一点"——
+            # 但"整本精读"这条根本没有页范围可缩，用户照着做不了。改成**按读法给可照做的出路**。
+            from .schemas import OutlineError as _OE
+
+            need = len(planned)
+            how = ("把「一次读多少页」改成不小于 %d（也就是这本书的页数），"
+                   "或者把读法换成「按页范围读」分成几次读" % need) \
+                if strategy == STRATEGY_FULL else \
+                ("把「一次读多少页」填到不小于 %d，或者把页范围改小一点" % need)
+            raise _OE(f"这本书有 {need} 页，但你设的「一次读多少页」是 {limit} 页——"
+                      f"这次一页都没读。想读完整本：{how}。")
     else:
         if strategy == STRATEGY_FAST and len(files) > 6:
             # 页面图片没有目录可挑：快读＝先读前几张（**如实标成抽样**）

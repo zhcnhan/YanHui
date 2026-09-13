@@ -321,6 +321,10 @@ type ImportJob = {
   poll_zh?: string;
 };
 
+/** 2026-09-13：后端中文里带 Markdown 星号，但有些位置是**当纯文本**渲染的 ⇒ 会漏出 `**`。
+ *  这些位置统一过一遍这个函数；走 MdMath（支持 ** 加粗）的地方不要用。 */
+const stripMd = (s: unknown) => String(s ?? "").replace(/\*\*/g, "");
+
 export default function OutlinePage() {
   const { id = "" } = useParams();
   const nav = useNavigate();
@@ -374,6 +378,12 @@ export default function OutlinePage() {
   const [draftingMode, setDraftingMode] = useState(false);
   // R39 §1：最近一次"单元出稿"的就地账目（丢弃/降级/失败——界面必须能看见）
   const [lastUnitLedger, setLastUnitLedger] = useState<LedgerEntry[] | null>(null);
+  // 2026-09-13：读书账那张展开卡的用户选择（null＝还没点过，按数据决定默认开合）
+  const [accountOpen, setAccountOpen] = useState<boolean | null>(null);
+  // 2026-09-13（用户实测："重读这几页…完事了也没有反馈"）：
+  // 重读的结果原来只进页面**顶部**那条横幅，而按钮在材料行里 ⇒ 点完看不到。
+  // 这里按材料记一条**就地反馈**，直接显示在被点的那一行下面。
+  const [rereadNote, setRereadNote] = useState<Record<string, string>>({});
 
   const setMaterialRole = async (mid: string, role: string) => {
     setBusy(true);
@@ -427,7 +437,7 @@ export default function OutlinePage() {
         `/subjects/${id}/materials/upload-pdf`, fd
       );
       if (r.text_health && r.text_health.checked && !r.text_health.healthy) {
-        setErr(`PDF 已入库「${r.title}」，但没有可用文本层：${r.text_health.note}`);
+        setErr(`PDF 已入库「${r.title}」，但没有可用文本层：${stripMd(r.text_health.note)}`);
       } else {
         // R55 A：导入那一刻就把"这份材料好不好用"说清楚（人话，不堆数字）
         setMsg(`PDF 已入库「${r.title}」（${r.pages} 页）。体检结论：${r.text_health?.summary_zh || "可以直接用。"}`);
@@ -525,11 +535,13 @@ export default function OutlinePage() {
     const pagesSpec = (spec ?? rereadPages).trim();
     if (!pagesSpec) {
       setErr("请先填要重读的页（例如 3 或 3-5；页号从 1 开始数）");
+      setRereadNote((m) => ({ ...m, [mid]: "还没填要重读第几页——先在上面那个框里填，例如 3 或 3-5。" }));
       return;
     }
     setBusy(true);
     setErr("");
     setMsg("");
+    setRereadNote((m) => ({ ...m, [mid]: "正在重读…（这一步要问模型，会花钱；页多时要等一会儿）" }));
     try {
       const r = await api.post<{
         title: string; reread: string[]; count: number; unreadable?: string[];
@@ -541,21 +553,66 @@ export default function OutlinePage() {
       if (!r.count) {
         // 没读不出来的页 → 后端**不调用模型**，这里照实说（别让人以为"点了没反应"）；
         // 全是"标签读不出页号"的旧页时后端也会在这句话里如实写明跳过了哪几页
-        setMsg(`「${title}」：${r.note_zh || r.reason_zh || "没有需要重读的页"}`);
+        const said = `「${title}」：${r.note_zh || r.reason_zh || "没有需要重读的页"}`;
+        setMsg(said);
+        setRereadNote((m) => ({ ...m, [mid]: said + skipMsg }));
       } else {
-        setMsg(`「${title}」已重新读：${r.reread.join("、")}（共 ${r.count} 页）。` +
+        const said = `「${title}」已重新读：${r.reread.join("、")}（共 ${r.count} 页）。` +
           (r.unreadable?.length ? `还是读不出来：${r.unreadable.join("、")}。` : "") +
-          skipMsg +
-          "其它页的记录没有动；这一步同样要问模型，也会花钱。");
+          skipMsg;
+        setMsg(said + "其它页的记录没有动；这一步同样要问模型，也会花钱。");
+        setRereadNote((m) => ({ ...m, [mid]: said }));
       }
       setRereadPages("");
       await loadMaterials();
     } catch (e) {
       setErr(String(e));
+      setRereadNote((m) => ({ ...m, [mid]: "这次重读没成功：" + String(e) }));
     } finally {
       setBusy(false);
     }
   };
+
+  // 2026-09-13：这个学科有没有"连图一起看"（全 AI）材料。
+  // 有 → 起草大纲该走**本模式那条路**（按页记录排单元）；没有 → 才走文字教材那条路。
+  const hasAllAiMaterial = materials.some((m) => m.mode === "all_ai");
+
+  // 2026-09-13（用户实测："临时起草的大纲没有一个临时储存嘛？刷新换个页面就没啦。
+  // 我又得费一遍 token"）：起草出来的**候选**原来只存在内存里 ⇒ 一刷新就没了，白花钱。
+  // 现在**按学科**存一份在浏览器本地（localStorage，不上传、不入库），刷新/切页自动恢复；
+  // 「采纳」或「放弃候选」时才清掉。这是本地草稿，不是服务端状态。
+  const candidateKey = `yanhui:outline-candidate:${id}`;
+  const briefKey = `yanhui:outline-brief:${id}`;
+  useEffect(() => {
+    if (!id) return;
+    try {
+      const raw = localStorage.getItem(candidateKey);
+      if (raw) setCandidate(JSON.parse(raw) as never);
+      const b = localStorage.getItem(briefKey);
+      if (b) setDraftBrief(b);
+    } catch {
+      /* 本地存储坏了不影响使用，只是没有草稿 */
+    }
+    // 只在切换学科时读一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+  useEffect(() => {
+    if (!id) return;
+    try {
+      if (candidate) localStorage.setItem(candidateKey, JSON.stringify(candidate));
+      else localStorage.removeItem(candidateKey);
+    } catch {
+      /* 存不下就算了，不打扰用户 */
+    }
+  }, [candidate, id, candidateKey]);
+  useEffect(() => {
+    if (!id) return;
+    try {
+      if (draftBrief) localStorage.setItem(briefKey, draftBrief);
+    } catch {
+      /* 同上 */
+    }
+  }, [draftBrief, id, briefKey]);
 
   const draftModeOutline = async () => {
     setDraftingMode(true);
@@ -611,7 +668,24 @@ export default function OutlinePage() {
       setMsg(r.poll_zh || "已开始导入：进度会一直在页面上更新（可以随时点「停止这次导入」）。");
       if (inp) inp.value = "";
     } catch (e) {
-      setErr(String(e));
+      // 2026-09-13 修（用户实测："改完数字再点导入没反应，必须刷新"）：
+      // 真身是**上一次导入还挂着** —— 后端回 409「这个学科已经有一次导入在进行」。
+      // 原来只把这句话丢进横幅，用户看不到"该去哪停它"，感觉就是"按钮坏了"。
+      // 这里就地接住：把正在跑的那次任务**显示出来**（那张卡片自带「停止这次导入」）。
+      const msg = String(e);
+      setErr(msg);
+      if (msg.includes("已经有一次导入在进行")) {
+        try {
+          const r = await api.get<{ active: ImportJob | null }>(`/subjects/${id}/import-jobs`);
+          if (r.active && r.active.id) {
+            jobIdRef.current = r.active.id;
+            setJob(r.active);
+            setErr(msg + "（下面就是那次导入：点「停止这次导入」就能重新开始。）");
+          }
+        } catch {
+          /* 接不住就保留原样，绝不静默 */
+        }
+      }
     } finally {
       setBusy(false);
     }
@@ -943,11 +1017,23 @@ export default function OutlinePage() {
     setMsg("");
     try {
       await api.put(`/subjects/${id}/outline`, {
-        units: candidate.units,
+        // 2026-09-13：采纳前**兜一道底**——结构上限是每单元最多 5 条学习目标（后端会拒），
+        // 万一还有更长的，这里先收敛，别让用户撞上"数据不合法、请修正后重试"。
+        units: candidate.units.map((u) => ({
+          ...u,
+          objectives: (u.objectives ?? []).slice(0, 5),
+        })),
         status: "active",
-        source: candidate.source === "heuristic" ? "heuristic" : candidate.source,
+        // 2026-09-13 修（用户实测：采纳图版教材的候选 → 422「自定义大纲 source 非法: 'all_ai'」）：
+        // 后端 source 的白名单是 roadmap / ai / heuristic / manual / hybrid，
+        // 而"图版教材起草"（按页面记录）给的是 "all_ai" —— 那是**材料模式**的名字，不是大纲来源。
+        // 它本质就是 AI 生成的 ⇒ 记成 "ai"。（不动后端契约。）
+        source: candidate.source === "heuristic" ? "heuristic"
+          : candidate.source === "all_ai" ? "ai"
+          : candidate.source,
       });
       setCandidate(null);
+      try { localStorage.removeItem(candidateKey); } catch { /* 忽略 */ }
       await load();
       setMsg("大纲已采纳（revision+1）");
     } catch (e) {
@@ -1146,10 +1232,10 @@ export default function OutlinePage() {
           {searchRes && (
             <div style={{ marginTop: 6 }}>
               {searchRes.backend && !searchRes.backend.configured && (
-                <div className="banner warn">检索后端未配置（当前无检索 provider）。{searchRes.note}</div>
+                <div className="banner warn">检索后端未配置（当前无检索 provider）。{stripMd(searchRes.note)}</div>
               )}
               {searchRes.note && searchRes.backend?.configured && (
-                <div className="dim">{searchRes.note}</div>
+                <div className="dim">{stripMd(searchRes.note)}</div>
               )}
               {searchRes.items.length > 0 && (
                 <>
@@ -1241,12 +1327,12 @@ export default function OutlinePage() {
           </div>
           {modeEntry && !modeEntry.vision_ready && (
             <div className="banner warn" style={{ marginTop: 6 }}>
-              {modeEntry.vision_note_zh}
+              {stripMd(modeEntry.vision_note_zh)}
             </div>
           )}
           {modeEntry && modeEntry.pdf_render_ready === false && (
             <div className="banner warn" style={{ marginTop: 6 }}>
-              这台机器上还不能自动把 PDF 转成页面图片。{modeEntry.pdf_render_note_zh}
+              这台机器上还不能自动把 PDF 转成页面图片。{stripMd(modeEntry.pdf_render_note_zh)}
             </div>
           )}
           <div className="input-row" style={{ gap: 8, marginTop: 6 }}>
@@ -1327,7 +1413,7 @@ export default function OutlinePage() {
                               style={{ width: "100%", marginTop: 4 }} />
                   )}
                   <div className="dim" style={{ fontSize: 12 }}>
-                    {job.note_zh} 已经读到的页会一直存在材料里——现在停也不会白读。
+                    {stripMd(job.note_zh)} 已经读到的页会一直存在材料里——现在停也不会白读。
                   </div>
                   <button className="ghost" disabled={cancelling} onClick={() => void cancelImport()}>
                     {cancelling ? "正在停止…" : "停止这次导入"}
@@ -1340,7 +1426,7 @@ export default function OutlinePage() {
                       : job.status === "failed" ? "这次导入没能继续"
                         : `读完了：共 ${job.done} 页`}
                   </strong>
-                  <div className="dim" style={{ fontSize: 12 }}>{job.note_zh}</div>
+                  <div className="dim" style={{ fontSize: 12 }}>{stripMd(job.note_zh)}</div>
                   {!!job.unreadable?.length && (
                     <div className="dim" style={{ fontSize: 12 }}>
                       读不出来的页：{job.unreadable.join("、")}（已如实标注，不会当成内容用）
@@ -1374,10 +1460,13 @@ export default function OutlinePage() {
           <div style={{ marginTop: 8 }}>
             {materials.map((m) => (
               <div key={m.id} className="row-divider"
-                   style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+                   style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start",
                             padding: "4px 0", gap: 8 }}>
-                <div style={{ minWidth: 0 }}>
-                  <strong>{m.title}</strong>{" "}
+                {/* 2026-09-13 修：这里原来是 minWidth: 0 —— 在 flex 行里等于"允许被压到没宽度"，
+                    中文就会**逐字换行竖着排**（用户实测：提示块整段竖着来）。
+                    改成 flex: 1 1 auto + minWidth: 280：文字块正常占宽，右侧按钮组不让位。 */}
+                <div style={{ flex: "1 1 auto", minWidth: 280 }}>
+                  <strong>{String(m.title).replace(/\*\*/g, "")}</strong>{" "}
                   <span className="badge">{KIND_LABEL[m.kind] ?? m.kind}</span>{" "}
                   {/* R56：材料的来源模式（界面一直能看出"这条材料走的是哪条路"） */}
                   {m.mode === "all_ai" && (
@@ -1397,12 +1486,12 @@ export default function OutlinePage() {
                       <span className={`badge ${m.text_health.grade === "好" ? "pass" : "deferred"}`}>
                         体检：{m.text_health.grade || "—"}
                       </span>{" "}
-                      {m.text_health.summary_zh}
+                      {String(m.text_health.summary_zh).replace(/\*\*/g, "")}
                       {m.text_health.fixed && <>{" "}（已做抽取修正，原始文本留档：{m.text_health.raw_file || "有"}）</>}
                     </div>
                   )}
                   {m.text_health?.checked && !m.text_health.healthy && (
-                    <div className="dim error-text" style={{ fontSize: 12 }}>{m.text_health.note}</div>
+                    <div className="dim error-text" style={{ fontSize: 12 }}>{stripMd(m.text_health.note)}</div>
                   )}
                   {/* R67 任务 A：这份材料"上次读到哪了"（程序重启过也照样看得见） */}
                   {!!m.import_state?.total && m.import_state.state !== "done" && (
@@ -1431,8 +1520,8 @@ export default function OutlinePage() {
                   )}
                   {/* R67 任务 E：按这份材料的特征给一句人话建议 + 选错了能一键改道 */}
                   {m.suggest?.better === "pages" && (
-                    <div className="dim" style={{ fontSize: 12 }}>
-                      💡 {m.suggest.reason_zh}
+                    <div className="dim" style={{ fontSize: 12, flex: "1 1 100%", minWidth: 0 }}>
+                      💡 {String(m.suggest.reason_zh).replace(/\*\*/g, "")}
                       {m.suggest.can_switch_to_pages && (
                         <button className="ghost" disabled={busy} style={{ marginLeft: 6 }}
                                 onClick={() => void switchToPages(m.id)}
@@ -1446,8 +1535,8 @@ export default function OutlinePage() {
                     </div>
                   )}
                   {m.mode === "all_ai" && m.suggest?.can_switch_to_text && (
-                    <div className="dim" style={{ fontSize: 12 }}>
-                      💡 {m.suggest.reason_zh}
+                    <div className="dim" style={{ fontSize: 12, flex: "1 1 100%", minWidth: 0 }}>
+                      💡 {String(m.suggest.reason_zh).replace(/\*\*/g, "")}
                       <button className="ghost" disabled={busy} style={{ marginLeft: 6 }}
                               onClick={() => void switchToText(m.id)}
                               title="不用重新上传：用同一份 PDF 再存一份「只看文字」的材料；原来这份一字不动">
@@ -1466,10 +1555,13 @@ export default function OutlinePage() {
                   )}
                   {/* R58 C：按需重读某几页（图示教材模式；只重读你填的那几页，其它页不动） */}
                   {m.mode === "all_ai" && (
-                    <span style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+                    /* 2026-09-13 修：原来是个 inline-flex span，被挤在窄列里 ⇒ 输入框和按钮错位。
+                       改成**独占一行**（flex 1 1 100% + 换行），输入框给足宽度。 */
+                    <span style={{ display: "flex", flex: "1 1 100%", gap: 6,
+                                   alignItems: "center", flexWrap: "wrap", marginTop: 2 }}>
                       <input value={rereadPages} onChange={(e) => setRereadPages(e.target.value)}
                              placeholder="重读第几页（如 3 或 3-5）"
-                             style={{ width: 150 }}
+                             style={{ width: 180, flex: "0 0 auto" }}
                              title="页号从 1 开始数；可以写 3 或 3-5（按页范围重读）" />
                       <button className="ghost" disabled={busy}
                               onClick={() => void rereadMaterialPages(m.id, m.title)}
@@ -1506,6 +1598,13 @@ export default function OutlinePage() {
                         撤销指定
                       </button>
                     </span>
+                  )}
+                  {/* 2026-09-13（用户实测："重读…完事了也没有反馈"）：结果**就地**显示在被点的那一行，
+                      不再只进页面顶部那条横幅（按钮在这里、横幅在上面，等于看不到）。 */}
+                  {rereadNote[m.id] && (
+                    <div className="dim" style={{ fontSize: 12, marginTop: 4, minWidth: 0 }}>
+                      {rereadNote[m.id]}
+                    </div>
                   )}
                   {/* R38 B2：材料角色（主教材定顺序与范围；未标注 → 按导入顺序并在覆盖账注明） */}
                   <select
@@ -1580,22 +1679,40 @@ export default function OutlinePage() {
                   <option key={n} value={n}>{n} 单元</option>
                 ))}
               </select>
-              <button className="primary" disabled={busy} onClick={() => draft(false)}>
+              {/* 2026-09-13（用户实测反馈）：以前这里只有一个按钮，而"图版教材"要走的是
+                  **另一条路**（按页记录排单元）——两条路摆在一起，用户以为是一个功能的两半。
+                  现在按材料类型**自动走对的那条**：有"连图一起看"的材料就走本模式起草。 */}
+              {hasAllAiMaterial && (
+                <button className="primary" disabled={busy || draftingMode}
+                        onClick={() => void draftModeOutline()}>
+                  {draftingMode ? "正在按页面记录排大纲…" : "一键起草大纲（按这份图版教材）"}
+                </button>
+              )}
+              <button className={hasAllAiMaterial ? "" : "primary"} disabled={busy}
+                      onClick={() => draft(false)}>
                 {outline ? "重新起草（会丢掉当前这份）" : "让 AI 起草大纲"}
               </button>
             </div>
             <div className="dim">
               起草只是先给一份候选，不会直接覆盖；你看过之后点「采纳」才会生效（版本号 +1）。
               没有配 AI 时会用内置的简单办法先排一版。
-              {/* R42 B3：`count` 语义的 UI 说明（避免用户以为"我填了 20 却出 46"是 bug） */}
-              {materials.length > 0 && (
+              {/* 2026-09-13 修正：这句话以前写死成"「单元数」只在没有教材时有用"，
+                  但**图版教材**（连图一起看）走的是另一条路，它**认**这个数字。 */}
+              {hasAllAiMaterial ? (
+                <>
+                  <br />
+                  这份材料是<strong>图版教材</strong>：上面选「一键起草大纲（按这份图版教材）」
+                  —— 它按<strong>页面记录</strong>排单元，<strong>你选的单元数会被用上</strong>；
+                  页数多的书建议选大一点（比如 100 页选 15），不然一个单元要装十几页。
+                </>
+              ) : materials.length > 0 ? (
                 <>
                   <br />
                   ⚠️ <strong>「单元数」只在没有教材时有用</strong>：有教材时，{" "}
                   <strong>单元数是按书的章节来的</strong>（每章/每节至少一个单元），
                   所以实际会多于或少于你选的数量——这是<strong>照着书排</strong>，不是出错。
                 </>
-              )}
+              ) : null}
               {materials.length > 0
                 ? `起草时会先读教材（当前 ${materials.length} 份），完全按书的章节来排单元：每个章节都会对应到单元，没人用的章节按目录补齐。`
                 : "（还没有教材：只能按你写的简介排，生成的内容会标注「没有教材依据」。）"}
@@ -1604,7 +1721,7 @@ export default function OutlinePage() {
         )}
         {candidate && (
           <div className="card accent">
-            <h2>起草候选（{candidate.source === "ai" ? "AI 生成" : "内置办法生成"}，还没生效）</h2>
+            <h2>起草候选（{candidate.source === "heuristic" ? "内置办法生成" : "AI 生成"}，还没生效）</h2>
             {candidate.problems?.length > 0 && (
               <div className="banner warn">需要留意：{candidate.problems.slice(0, 5).join("；")}</div>
             )}
@@ -1667,7 +1784,10 @@ export default function OutlinePage() {
             )}
             <div style={{ marginTop: 10 }}>
               <button className="primary" onClick={adopt} disabled={busy}>采纳此大纲</button>{" "}
-              <button onClick={() => setCandidate(null)} disabled={busy}>放弃候选</button>
+              <button onClick={() => {
+                      setCandidate(null);
+                      try { localStorage.removeItem(candidateKey); } catch { /* 忽略 */ }
+                    }} disabled={busy}>放弃候选</button>
             </div>
           </div>
         )}
@@ -1690,7 +1810,7 @@ export default function OutlinePage() {
               </span>
             )}
           </div>
-          {outline.note && <div className="dim">{outline.note}</div>}
+          {outline.note && <div className="dim">{stripMd(outline.note)}</div>}
           {materialTitles(outline.source_materials, materials).length > 0 && (
             <div className="banner ok" style={{ margin: "6px 0" }}>
               这份大纲依据的教材（{materialTitles(outline.source_materials, materials).length} 份）：
@@ -1738,7 +1858,7 @@ export default function OutlinePage() {
                       <tr key={b.material_id} className="row-divider">
                         <td style={{ padding: "3px" }}>{b.title}</td>
                         <td style={{ padding: "3px" }}>
-                          {b.role_zh}
+                          {stripMd(b.role_zh)}
                           {b.role_explicit ? "" : "（未标注）"}
                         </td>
                         <td style={{ padding: "3px", textAlign: "center" }}>
@@ -1752,7 +1872,7 @@ export default function OutlinePage() {
                         <td style={{ padding: "3px", textAlign: "center" }}>
                           {b.health_grade
                             ? <span className={`badge ${b.health_grade === "好" ? "pass" : b.health_grade === "差" ? "error" : "deferred"}`}
-                                    title={b.health_summary_zh}>
+                                    title={stripMd(b.health_summary_zh)}>
                                 {b.health_grade}
                                 {!!b.image_count && ` · ${b.image_count} 图`}
                               </span>
@@ -1782,7 +1902,15 @@ export default function OutlinePage() {
               {/* R67 任务 D：**读书账说实话**——进流程多少字 / 没进去多少字 / 差在哪。
                   （以前这里看着像"全读了"，其实有 12% 的正文根本没进去；现在如实列出） */}
               {coverage.text_account && (coverage.text_account.materials?.length ?? 0) > 0 && (
-                <details style={{ marginTop: 6 }} open={(coverage.text_account.not_injected_chars ?? 0) > 0}>
+                /* 2026-09-13 修（用户实测："点了收起之后就无法展开，他直接消失了"）：
+                   原来是 `open={…}`（纯受控、且没有 onToggle）—— 这是**单向**的：
+                   用户点收起后，页面每次重渲染（导入进度在轮询）都把它按回原值，
+                   看起来就是"收起没反应 / 那块整个消失"。
+                   现在改成**受控 + onToggle 记住用户的选择**：默认仍按数据展开，
+                   但你点过一次之后，就听你的，重渲染也不再弹回去。 */
+                <details style={{ marginTop: 6 }}
+                         open={accountOpen ?? (coverage.text_account.not_injected_chars ?? 0) > 0}
+                         onToggle={(e) => setAccountOpen((e.currentTarget as HTMLDetailsElement).open)}>
                   <summary className="dim">
                     读书账（进流程 {charsText(coverage.text_account.injected_chars ?? 0)}，
                     没进去 {charsText(coverage.text_account.not_injected_chars ?? 0)}）
@@ -1798,7 +1926,7 @@ export default function OutlinePage() {
                   <ul className="plain" style={{ margin: "4px 0 0 12px", fontSize: 12 }}>
                     {(coverage.text_account.materials ?? []).map((a) => (
                       <li key={a.material_id} style={{ marginTop: 2 }}>
-                        《{a.title}》：{a.note_zh}
+                        《{a.title}》：{stripMd(a.note_zh)}
                       </li>
                     ))}
                   </ul>
@@ -1973,7 +2101,7 @@ export default function OutlinePage() {
                               if (!c || c.status === "未知") return null;
                               return (
                                 <span className={`badge ${COVERAGE_CLS[c.status] ?? ""}`}
-                                      title={c.note}>
+                                      title={stripMd(c.note)}>
                                   教材：{c.status}
                                 </span>
                               );
@@ -1981,7 +2109,7 @@ export default function OutlinePage() {
                             {/* R42 B2：难度被"非降钳制"抬高 —— 大纲页单元行**可见**（不只在库里） */}
                             {u.meta?.difficulty_raised && (
                               <span className="badge deferred"
-                                    title={u.meta.difficulty_raised.reason_zh}>
+                                    title={stripMd(u.meta.difficulty_raised.reason_zh)}>
                                 难度调高了 {u.meta.difficulty_raised.from}→{u.meta.difficulty_raised.to}
                               </span>
                             )}
@@ -2013,7 +2141,7 @@ export default function OutlinePage() {
                                 );
                               }
                               return c.usable === false ? (
-                                <span className="badge deferred" title={c.content_reason_zh}>还没内容</span>
+                                <span className="badge deferred" title={stripMd(c.content_reason_zh)}>还没内容</span>
                               ) : (
                                 <span className="badge pass">有内容</span>
                               );

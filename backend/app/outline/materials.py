@@ -41,6 +41,11 @@ ROLE_UNSET = ""
 ROLES = (ROLE_MAIN, ROLE_SUPPLEMENT)
 ROLE_LABELS_ZH = {ROLE_MAIN: "主教材", ROLE_SUPPLEMENT: "补充材料", ROLE_UNSET: "未标注"}
 
+# 2026-09-13：材料 id → 学科 id 的登记表（构建材料索引时填）。
+# 用途：`valid_sections` 要让"图版教材"的**页记录标签**也算合法溯源，
+# 而索引条目本身不带 subject_id；这样不必改动一串函数签名。
+_MATERIAL_SUBJECT: dict[str, str] = {}
+
 # ---------- R38 A1/A5：两个滑块（单次调用预算 / 总注入上限）的档位与内置默认 ----------
 BATCH_TIERS = (("省着用", 20000), ("常规（默认）", 60000), ("充裕", 150000), ("不限", 0))
 INJECT_TIERS = (("省着用", 20000), ("常规（默认）", 60000), ("充裕", 150000), ("不限", 0))
@@ -793,8 +798,12 @@ def _material_index(db, subject_id: str) -> list[dict]:
             health["healthy"] = False
         _merge_extract_meta(health, e.get("extract_meta") or {})
         role = str(e.get("role") or "")
+        mid = str(e["id"])
+        # 2026-09-13：`valid_sections` 要按"页记录"（而不是文字层）收页标签，
+        # 而索引条目里没有 subject_id —— 在这里登记一份，免得改动一串函数签名。
+        _MATERIAL_SUBJECT[mid] = subject_id
         out.append({
-            "id": e["id"], "title": e["title"], "source": e["source"], "url": e["url"],
+            "id": mid, "title": e["title"], "source": e["source"], "url": e["url"],
             "kind": e.get("kind", "local"), "filename": e.get("filename", ""),
             # **R67**：`pages_file`（页面记录文件）与 `mode` 要带给下游——
             # 否则"读到哪了 / 是不是抽样读"在覆盖账里查不到（账就说不实话了）
@@ -1639,7 +1648,14 @@ def _block_sources(block: dict) -> list[dict]:
 
 
 def valid_sections(hit: dict) -> set[str]:
-    """材料的**合法溯源标签**全集（归一化后）：章/节地图标签 ∪ 页标签 ∪ 分节标签。"""
+    """材料的**合法溯源标签**全集（归一化后）：章/节地图标签 ∪ 页标签 ∪ 分节标签。
+
+    **2026-09-13 修（用户实测：采纳图版教材大纲时报「单元 a123.u13 的材料溯源不成立」）**：
+    "连图一起看"（`all_ai`）材料的页依据来自**页记录**（逐页读出来的，实测 100 页），
+    而这里以前只收**文字层**切出来的页标签（实测只到 92 页）⇒ **第 93 页以后一律被判"不合法"**，
+    连"引文过短"这种莫名其妙的理由都冒出来了。
+    现在把**页记录里的页标签**并进来，页号从哪来就以哪为准。
+    """
     from ..content import citations
 
     labels: set[str] = set()
@@ -1650,6 +1666,26 @@ def valid_sections(hit: dict) -> set[str]:
         labels.add(citations.normalize(entry.label))
         for pg in entry.pages:
             labels.add(citations.normalize(pg))
+    if str(hit.get("mode") or "") == MODE_ALL_AI:
+        try:
+            from . import mode_pages
+
+            sid_hint = str(hit.get("subject_id") or _MATERIAL_SUBJECT.get(str(hit.get("id") or "")) or "")
+            if sid_hint:
+                for rec in mode_pages.load_pages(sid_hint, str(hit.get("id") or "")):
+                    lab = citations.normalize(str(rec.get("page_label") or ""))
+                    if lab:
+                        labels.add(lab)
+        except Exception:
+            # 页记录读不到不影响其它标签生效（宁可少一条，也不要炸）
+            pass
+    # 页范围写法归一：模型有时写 `第 13 页-第 17 页`（半角连字符）/`~`，页记录里是 `–`。
+    # ⚠️ 关键：`citations.normalize` **先删掉连字符**（`第13页-第17页`→`第13页第17页`），
+    # 所以集合里此刻存的是**无连接号**形式。这里补一份"删掉连接号"的等价标签，
+    # 让三种写法（`-` / `~` / `–`）都能命中。
+    for lab in list(labels):
+        if "–" in lab:
+            labels.add(lab.replace("–", ""))
     return {x for x in labels if x}
 
 

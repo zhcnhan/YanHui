@@ -14,6 +14,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from ..ai.calls import ModeExerciseIn, ModeLessonIn
 from ..content.schemas import CheckDoc, ExerciseDoc, ExplanationDoc, NodeDoc
 from ..service import mode_ai
@@ -70,22 +72,96 @@ def draft_mode_outline(db, subject_id: str, *, brief: str = "", count: int = 0, 
 
     units: list[dict] = []
     covered: set[str] = set()
+    # 2026-09-13 修（用户实测：采纳时报「学习目标最多 5 条，这次给了 6 条」）：
+    # 结构上限是 5 条，但模型可能给更多 ⇒ 以前会把「不可采纳的候选」直接丢给用户，
+    # 逼他自己去删。**这不该由用户承担**：这里就收敛到上限，并**如实记账**（不静默丢）。
+    OBJ_MAX = 5
+    trimmed: list[str] = []
     for i, u in enumerate(out.units or [], start=1):
         src = [str(x) for x in (u.source_pages or []) if str(x).strip()]
         for s in src:
             covered.add(s)
+        objs = [str(x).strip() for x in (u.objectives or []) if str(x).strip()]
+        if len(objs) > OBJ_MAX:
+            trimmed.append(f"第 {i} 个单元（原有 {len(objs)} 条）")
+            objs = objs[:OBJ_MAX]
         units.append({"id": f"{subject_id}.u{i:02d}", "title": u.title or f"第 {i} 部分",
-                      "objectives": list(u.objectives or []),
+                      "objectives": objs,
                       "concept_tags": list(u.concept_tags or []),
                       "group": "教材", "prereqs": ([f"{subject_id}.u{i - 1:02d}"] if i > 1 else []),
                       "difficulty": min(3, max(1, i)), "requires_thinking": False,
                       "materials": [{"title": _pages_title(db, subject_id), "section": s}
                                     for s in src] or [{"title": _pages_title(db, subject_id),
                                                        "section": ""}]})
+    if trimmed:
+        ledger.note(ledger.CAT_GENERATION, "大纲起草（图示教材模式）",
+                    "模型给的学习目标条数超过了结构上限（每单元最多 "
+                    f"{OBJ_MAX} 条），已保留前面各条、多余的去掉了：{'、'.join(trimmed)}——"
+                    "这样这份候选可以直接采纳，不用你手工删。",
+                    impact=ledger.SCOPE_SUBJECT, remedy=ledger.REMEDY_YES, subject_id=subject_id,
+                    detail={"kind": "mode_outline_objectives_trimmed", "units": trimmed})
     absorbed = [lab for lab in all_labels if lab not in covered]
     if absorbed and units:
         units[-1]["materials"].extend({"title": _pages_title(db, subject_id), "section": lab}
                                       for lab in absorbed)
+    # 2026-09-13 修（用户实测：采纳时报「教材覆盖不全：20/22 个章/节条目没有任何单元对应」）：
+    # 采纳那条硬规矩是"**教材全覆盖**"（教材＝权威真源，不许悄悄丢章节）。
+    # 而这里的单元是模型排的，它**不保证每段都点到** ⇒ 候选明明有内容、却因为"没覆盖全"被拒。
+    # 按既有"页不丢"同一条思路，这里再补一层**"章节条目不丢"**：
+    # 凡是没有任何单元提到的章节条目，机械地把它的首页挂到**页号最接近**的那个单元上，并如实记账。
+    group_filled: list[str] = []
+
+    # ⚠️ 这里**不 import `content.citations`**：架构红线要求"模式大纲服务不许 import 路径②的机器"
+    #   （`test_r57_b1` 就是钉这条的）。所以就地写一个极简归一：只去空白、空白类字符。
+    def _norm(s) -> str:
+        return re.sub(r"[\s\u3000]+", "", str(s or ""))
+
+    covered_norm: set[str] = {_norm(x) for x in covered} | {_norm(x) for x in all_labels}
+
+    def _page_no(lab) -> int:
+        m = re.search(r"\d+", str(lab or ""))
+        return int(m.group(0)) if m else 10 ** 6
+
+    for material in mat._material_index(db, subject_id):
+        for ent in (material.get("structure") or {}).get("entries") or []:
+            label = str(getattr(ent, "label", "") or "").strip()
+            pgs = [str(p) for p in (getattr(ent, "pages", None) or []) if str(p).strip()]
+            if not label and not pgs:
+                continue
+            # ★ 只补"**真的读到过**"的页：没读过的页**不许**借补全之名变成"已覆盖"
+            #   （`test_r67_f5` 钉的就是这条：抽样读的章不许假装覆盖）。
+            read_pgs = [p for p in pgs if p in all_labels]
+            if not read_pgs:
+                continue
+            # 覆盖判定认的是"条目标签"或"该条目的页标签"。
+            # ★ 只挂**单页标签**（一定在"已读页"里），绝不挂范围/章节标签：
+            #   范围标签可能含"没读到的页"（会把抽样读的章说成已覆盖），
+            #   而且它的写法（`章名（第 3 页–第 4 页）`）也不在已读页集合里。
+            section = read_pgs[0]
+            if _norm(section) in covered_norm:
+                continue
+            best_i, best_d = len(units) - 1, 10 ** 9
+            for i, u in enumerate(units):
+                for r in (u.get("materials") or []):
+                    d = abs(_page_no(r.get("section")) - _page_no(section))
+                    if d < best_d:
+                        best_i, best_d = i, d
+            if units:
+                units[best_i]["materials"].append(
+                    {"title": material["title"], "section": section})
+                covered.add(section)
+                covered_norm.add(_norm(section))
+                group_filled.append(f"{label or section} → 第 {best_i + 1} 个单元（{section}）")
+    if group_filled:
+        ledger.note(ledger.CAT_GENERATION, "大纲起草（图示教材模式）",
+                    f"模型排的单元没有点到 {len(group_filled)} 个章节条目，"
+                    "已按页号就近挂到相应单元上（教材要全覆盖才允许采纳）："
+                    f"{'；'.join(group_filled[:6])}——这样这份候选可以直接采纳，"
+                    "也不用担心有章节被悄悄丢掉。",
+                    impact=ledger.SCOPE_SUBJECT, remedy=ledger.REMEDY_YES,
+                    subject_id=subject_id,
+                    detail={"kind": "mode_outline_groups_filled",
+                            "groups": group_filled[:40]})
     if out.uncertain:
         ledger.note(ledger.CAT_GENERATION, "大纲起草（图示教材模式）",
                     f"模型对这次起草有保留：{out.uncertain_reason or '（没说原因）'}",

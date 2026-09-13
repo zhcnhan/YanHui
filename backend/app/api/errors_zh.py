@@ -77,6 +77,19 @@ def _type_zh(error: dict[str, Any]) -> str:
     if "dict" in typ or "object" in typ:
         return "格式错误（应为对象）"
     if "value_error" in typ:
+        # 2026-09-13 修（用户实测：采纳大纲时报「第 5 个单元数据不合法：参数校验失败：
+        # 学习目标：内容不符合要求」——**看不出到底哪里不合要求**）。
+        # 项目自己的校验器（如"学习目标最多 5 条"）会带一句中文原话，
+        # 以前这里把原话整个丢掉、只回一个类目名，用户没法照着改。
+        # 现在**把校验器自己的中文原话带出来**（没有原话才回退到类目名）。
+        raw = str(error.get("msg") or "").strip()
+        raw = re.sub(r"^Value error,\s*", "", raw)
+        for prefix in ("学习目标：", "学习目标:", "objectives："):
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):].strip()
+                break
+        if raw and re.search(r"[\u4e00-\u9fff]", raw) and raw != "内容不符合要求":
+            return raw
         return "内容不符合要求"
     return "格式或取值有误"
 

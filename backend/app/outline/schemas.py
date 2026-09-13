@@ -94,7 +94,18 @@ class OutlineUnit(BaseModel):
             if not title:
                 continue  # 无 title 的溯源项无意义（服务端在起草收尾处另记问题）
             out.append({"title": title, "section": str(it.get("section") or "").strip()})
-        return out[:3]  # 一个单元最多标 3 条依据（够用且防刷）
+        # 2026-09-13 修（用户实测：采纳图版教材候选时报「教材覆盖不全」）：
+        # 这里原来是 `out[:3]` —— "一个单元最多标 3 条依据"，那是**文字教材**的规矩
+        # （一个单元引两三章就够）。但**图版教材（连图一起看）是按页引用的**：
+        # 一个单元常常引用几十页，**超过 3 条会被默默砍掉** ⇒ 覆盖校验随即失败，
+        # 用户看到的是"教材覆盖不全"，根本联想不到是这里砍的。
+        # 现在**按引用形态区分**：整单元都在引"页"（如「第 12 页」/「第 5 页–第 8 页」）时放宽；
+        # 其它（文字教材那类章节引用）**保持 3 条不变**。
+        def _is_page_ref(s: str) -> bool:
+            t = str(s or "").strip()
+            return bool(t) and ("页" in t) and all(ch not in t for ch in "。；,，")
+        page_mode = bool(out) and all(_is_page_ref(x["section"]) for x in out)
+        return out[:200] if page_mode else out[:3]
 
     @field_validator("id")
     @classmethod
@@ -111,7 +122,8 @@ class OutlineUnit(BaseModel):
         # AI 起草提示词要求 ≤3（A4 落地）；上限 5 兼容既有数据（见 NOTES 疑点，待架构定口径）。
         cleaned = [str(x).strip() for x in v if str(x).strip()]
         if len(cleaned) > 5:
-            raise ValueError(f"objectives 过多（{len(cleaned)}>5）")
+            # 2026-09-13：原话写的是 "objectives 过多（7>5）" —— 界面上不该出现英文变量名与符号。
+            raise ValueError(f"学习目标最多 5 条，这次给了 {len(cleaned)} 条——删到 5 条以内再采纳")
         return cleaned
 
     @field_validator("concept_tags")
@@ -123,7 +135,8 @@ class OutlineUnit(BaseModel):
             if not s:
                 continue
             if len(s) > 64:
-                raise ValueError(f"概念标签过长（>64）：{s!r}")
+                # 2026-09-13：原来把整串标签回显给用户（几十上百字符），界面很难看。
+                raise ValueError(f"这个概念标签太长了（{len(s)} 个字，最多 64 个）——把它缩短一点")
             cleaned.append(s)
         return cleaned
 
