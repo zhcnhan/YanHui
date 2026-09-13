@@ -24,8 +24,13 @@ type Unit = {
     difficulty_raised?: { from: number; to: number; reason_zh: string; because?: string };
     absorbed_short?: { label: string; chars: number }[];
     coverage?: Record<string, unknown>;
+    // **R77 前置章**：凡例/前言/目录这类"书本身"的内容 —— 只读不练（讲解照旧、不出题、不进费曼）
+    front_matter?: boolean;
   };
 };
+
+/** R77：单元是不是前置章（只读不练）。标签/开关共用这一处判定。 */
+const isFrontMatter = (u: Unit): boolean => u.meta?.front_matter === true;
 
 /** R36 D3：把大纲层的 source_materials（material_id 列表）显示为材料标题。 */
 function materialTitles(ids: string[] | undefined, materials: MaterialItem[]): string[] {
@@ -141,6 +146,8 @@ type CoverageUnit = {
   taught_fact_count?: number;
   /** R55 B：这一节内容基本都在图里（系统读不到图）→ 没出内容（原因不同、下一步不同） */
   figure_unavailable?: boolean;
+  /** **R77**：前置章（只读不练）—— 有讲解、没有练习题是对的（别算成"还没内容"） */
+  front_matter?: boolean;
   /** R42 B4：章内该节级依据（R40 §2-3 提升项） */
   basis_section?: string;
   basis_quote?: string;
@@ -1043,6 +1050,27 @@ export default function OutlinePage() {
     }
   };
 
+  /** R77：在「前置章（只读不练）」与「正文章（照常出题）」之间切换。
+   *  只改**标记**：已有的题、已有的进度一个都不动（说清这一点，别让人以为题被删了）。 */
+  const toggleFrontMatter = async (u: Unit, next: boolean) => {
+    setBusy(true);
+    setErr("");
+    setMsg("");
+    try {
+      await api.patch(`/subjects/${id}/outline/units/${u.id}`,
+                      { fields: { meta: { ...(u.meta || {}), front_matter: next } } });
+      await load();
+      setMsg(next
+        ? `「${u.title}」已标为前置章：只读不练 —— 讲解照旧，不再出题、也不进费曼（已有的题不会删）。`
+        : `「${u.title}」已改回正文章：之后可以照常出题。这一章现在还没有题，`
+          + `请点「生成内容」重新生成一份（已有的讲解与进度不会被动）。`);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const saveTags = async (uid: string) => {
     setBusy(true);
     setErr("");
@@ -1767,7 +1795,14 @@ export default function OutlinePage() {
             {candidate.units.map((u, i) => (
               <div key={u.id} className="row-divider" style={{ padding: "4px 0" }}>
                 <strong>{i + 1}. {u.title}</strong>{" "}
-                <span className="badge">{u.group}</span>
+                <span className="badge">{u.group}</span>{" "}
+                {/* R77：AI 认出来的前置章（凡例/前言/目录…）在**采纳前**就看得见 */}
+                {isFrontMatter(u) && (
+                  <span className="badge deferred"
+                        title="凡例/前言/目录这类「书本身」的内容：讲解照旧，但不出题、也没有费曼复盘。采纳后可以在单元行上改。">
+                    前置章 · 只读不练
+                  </span>
+                )}
                 {u.prereqs.length > 0 && <span className="dim"> 前置：{u.prereqs.join("、")}</span>}
                 {u.materials && u.materials.length > 0 && (
                   <div className="dim" style={{ fontSize: 12 }}>
@@ -2096,6 +2131,13 @@ export default function OutlinePage() {
                           <td style={{ padding: "6px 4px" }}>
                             <strong>{u.title}</strong>
                             {u.status === "reviewed" && <span className="badge pass">已定稿</span>}
+                            {/* R77：前置章（凡例/前言/目录…）—— 一眼看出这章不用做题 */}
+                            {isFrontMatter(u) && (
+                              <span className="badge deferred"
+                                    title="凡例/前言/目录这类「书本身」的内容：讲解照旧，但不出题、也没有费曼复盘">
+                                前置章 · 只读不练
+                              </span>
+                            )}
                             {(() => {
                               const c = coverage?.units.find((x) => x.unit_id === u.id);
                               if (!c || c.status === "未知") return null;
@@ -2142,6 +2184,12 @@ export default function OutlinePage() {
                               }
                               return c.usable === false ? (
                                 <span className="badge deferred" title={stripMd(c.content_reason_zh)}>还没内容</span>
+                              ) : (isFrontMatter(u) || c.front_matter) ? (
+                                /* R77：前置章的账要如实——**有讲解、无练习**（别算成"没内容"） */
+                                <span className="badge pass"
+                                      title="前置章：讲解已经有了；这一章不出题（只读不练）">
+                                  有讲解 · 无练习
+                                </span>
                               ) : (
                                 <span className="badge pass">有内容</span>
                               );
@@ -2184,6 +2232,15 @@ export default function OutlinePage() {
                                 <button style={{ padding: "4px 10px" }} onClick={() => learnUnit(u.id)} disabled={busy}
                                   title={pv?.open ? "开始学习这个单元" : "还没解锁（要先学完前面的单元）"}>
                                   开始学习
+                                </button>{" "}
+                                {/* R77 任务⑤：前置章 / 正文章 的开关（用户点名要的"能改"）。
+                                    只改标记：已有的题与进度都不动。 */}
+                                <button style={{ padding: "4px 10px" }} disabled={busy}
+                                  onClick={() => void toggleFrontMatter(u, !isFrontMatter(u))}
+                                  title={isFrontMatter(u)
+                                    ? "改回正文章：之后可以照常出题（已有的讲解与进度不动，题目需要重新生成这一章）"
+                                    : "标成前置章：只读不练 —— 讲解照旧，不再出题、也不进费曼（已有的题不会删）"}>
+                                  {isFrontMatter(u) ? "改成正文章（照常出题）" : "标成前置章（只读不练）"}
                                 </button>
                                 {/* R54 C：点"还没内容"的单元 → 就地提示 + 一键生成（不把人带进空会话） */}
                                 {hintUnit === u.id && contentOf(u.id)?.usable === false && (

@@ -33,6 +33,8 @@ interface SubjectUnit {
   status: string;
   open: boolean;
   content_ids: string[];
+  /** **R77**：前置章（凡例/前言/目录…）—— 只读不练，地图上要标出来 */
+  front_matter?: boolean;
 }
 interface SubjectProgress {
   subject: string;
@@ -55,6 +57,8 @@ interface MapNode {
   state: string;
   kind?: string;
   hasContent: boolean;
+  /** **R77**：前置章（凡例/前言/目录…）—— 只读不练，地图上照样标出来 */
+  frontMatter?: boolean;
 }
 interface MapChapter {
   title: string;
@@ -221,6 +225,7 @@ export default function Dashboard() {
         title: u.title,
         state: unitState(u),
         hasContent: (u.content_ids || []).length > 0,
+        frontMatter: u.front_matter === true,
       })),
     }));
   }, [active, campaign, dash, progress]);
@@ -512,11 +517,13 @@ function Chapter({
               className={"map-node" + (n.kind === "boss" ? " boss" : "") + (n.hasContent ? "" : " nocontent")}
               disabled={busy || !clickable}
               title={
-                !n.hasContent
-                  ? `${n.title}（还没出内容——去大纲页生成）`
-                  : clickable
-                    ? `${n.title}（${STATE_ZH[n.state] ?? n.state}）——点一下开始`
-                    : `${n.title}（${STATE_ZH[n.state] ?? n.state}）——先把前面的单元学完`
+                n.frontMatter
+                  ? `${n.title}（前置章 · 只读不练：讲解照旧，不出题、也没有费曼复盘）`
+                  : !n.hasContent
+                    ? `${n.title}（还没出内容——去大纲页生成）`
+                    : clickable
+                      ? `${n.title}（${STATE_ZH[n.state] ?? n.state}）——点一下开始`
+                      : `${n.title}（${STATE_ZH[n.state] ?? n.state}）——先把前面的单元学完`
               }
               onClick={() => {
                 if (n.hasContent) onStart(n.id);
@@ -527,6 +534,7 @@ function Chapter({
               {n.kind === "boss" && <span aria-hidden="true">👑</span>}
               <span className="label">{n.title}</span>
               {!n.hasContent && <span className="faint">· 没内容</span>}
+              {n.frontMatter && <span className="faint">· 只读不练</span>}
             </button>
           );
         })}

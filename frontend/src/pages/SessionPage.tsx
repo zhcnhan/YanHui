@@ -387,6 +387,12 @@ export default function SessionPage() {
       {notice && <div className="banner ok">{notice}</div>}
       {/* R54 A：被守卫退回/需要先看讲解 → 中文说明（不是报错） */}
       {!!payload?.rewound_zh && <div className="banner warn">{String(payload.rewound_zh)}</div>}
+      {/* **R77 前置章**：只读不练 —— 说清"为什么这里没有题、也没有费曼"（别让人以为按钮坏了） */}
+      {!!payload?.front_matter && (
+        <div className="banner ok">
+          {String(payload.front_matter_zh || "这一章是前置内容：只读不练。")}
+        </div>
+      )}
 
       {error && <div className="banner error">{error}</div>}
       {thinkingSince !== null && (
@@ -545,7 +551,12 @@ export default function SessionPage() {
               </>
             )}
             <h2>掌握进度</h2>
-            <p>连续答对 3 题、再把费曼口述讲通过，就算学会了这个知识点，之后会定期提醒你复习。</p>
+            {payload?.front_matter ? (
+              // **R77 前置章**：不排练习、不排费曼 —— 这句话必须跟正文不一样，否则是自相矛盾
+              <p>这一章是前置内容（凡例/前言/目录这类）：<strong>读完就算完成</strong> —— 不出题、也没有费曼复盘。</p>
+            ) : (
+              <p>连续答对 3 题、再把费曼口述讲通过，就算学会了这个知识点，之后会定期提醒你复习。</p>
+            )}
           </div>
         </aside>
       </div>
@@ -865,6 +876,19 @@ function ChallengePanel({ view, answer, setAnswer, submitting, onBegin, onSubmit
 }
 
 function DoneView({ payload, onHome, onHistory }: any) {
+  // **R77 前置章**：读完就完成 —— 没有题、没有费曼，也**没有 FSRS 复习**（一张目录不值得定期提醒）
+  if (payload?.front_matter) {
+    return (
+      <div className="card done">
+        <h1>📖 这一节读完了</h1>
+        <p>{String(payload.front_matter_zh || "这一章是前置内容：只读不练。")}</p>
+        <p>后面的正文章已经解锁，可以接着学。</p>
+        <div className="input-row">
+          <button className="primary" onClick={onHome}>回仪表盘（看看下一步）</button>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="card done">
       <h1>🏆 掌握达标</h1>
