@@ -2386,6 +2386,9 @@ def coverage_ledger(db, subject_id: str) -> dict:
             "grounded_facts": int(cov.get("grounded_facts") or 0),
             "material_bound": bool(cov.get("material_bound")),
             "dropped_exercises": int(cov.get("dropped_exercises") or 0),
+            # **R77 补充**：剔了几道"没营养的题"（问页码/目录/版本/版式…）—— 界面要能看见
+            "low_value_dropped": int(cov.get("low_value_dropped") or 0),
+            "low_value_note_zh": str(cov.get("low_value_note_zh") or ""),
             "generated_at": str(cov.get("at") or ""),
             # R54 C：内容状态（同源）
             "has_content": bool(content.get("exists")),

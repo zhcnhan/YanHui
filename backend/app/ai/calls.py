@@ -583,6 +583,8 @@ class ModeExerciseIn(BaseModel):
     want_count: int = 3
     kind: Literal["practice", "challenge"] = "practice"
     asked_before: list[str] = Field(default_factory=list)
+    # **R77 补充**：上一轮被判"没营养"（问页码/目录/版本/版式…）的具体原因 → 回灌给模型换一道
+    errors: list[str] = Field(default_factory=list)
 
 
 class ModeExerciseOut(BaseModel):

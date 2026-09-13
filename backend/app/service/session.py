@@ -81,6 +81,8 @@ ACTIONS = {
     "finish",
     "quit",
     "get",                 # 恢复/刷新当前步
+    # **R77 补充**：做题答不出来 → 手动回讲解（不算答错、不扣分、不进账本；≠ 答错两次的自动回炉）
+    "rewind_explain",
 }
 
 CHALLENGE_ACTIONS = {"challenge_start", "challenge_begin", "challenge_submit",
@@ -88,6 +90,9 @@ CHALLENGE_ACTIONS = {"challenge_start", "challenge_begin", "challenge_submit",
 
 # R35 S3：UI/接口**必须显式标注**的挑战题说明（后端直出，前端只渲染——口径唯一）
 CHALLENGE_NOTICE = "挑战题：需要讲解之外的知识，答不出不影响任何进度"
+
+# **R77 补充**：手动"答不出来 → 回讲解"的说明（后端直出，前端只渲染；措辞是工单点名的）
+REWIND_EXPLAIN_ZH = "已回到讲解。这一步不算答错，不影响你的连对与进度；看完可以继续做题。"
 
 
 class SessionError(ValueError):
@@ -416,6 +421,8 @@ class SessionService:
             return self._act_submit(db, sess, node, payload)
         if action == "request_hint":
             return self._act_hint(db, sess, node, payload)
+        if action == "rewind_explain":
+            return self._act_rewind_explain(db, sess, node)
         if action == "regen_explain":
             return self._act_regen_explain(db, sess, node, payload)
         if action == "reissue_after_regen":
@@ -486,7 +493,12 @@ class SessionService:
                 self._front_matter_complete(db, sess, node)
                 return self._response(db, sess, events=[{"type": "front_matter_done"}])
             flow["stage"] = STAGE_PRACTICE
-            self._issue_next(db, sess, node)
+            # **R77 补充**：手动回讲解之后再回到练习时，**当前这题还在**（别清掉用户做了一半的东西）。
+            # ⚠️ 这条**只影响"手动回讲解"那条路**：正常流程（含答错两次的**自动回炉**）走到这里
+            #    `current` 一定是 None —— 回炉会整轮重置（`_practice_reset_cycle` 把 current 置空），
+            #    所以自动回炉的行为一个字都没变。
+            if flow["practice"]["current"] is None or flow["practice"]["passed"]:
+                self._issue_next(db, sess, node)
             return self._response(db, sess, events=[{"type": "stage_practice"}])
         if stage == STAGE_PRACTICE:
             # **R77**：前置章（例如刚被用户从"正文章"改成"前置章"）不许再出题
@@ -799,6 +811,23 @@ class SessionService:
                 "progress": self._progress_view(p),
             },
         )
+
+    def _act_rewind_explain(self, db: Session, sess: models.Session, node: NodeDoc) -> dict[str, Any]:
+        """**R77 补充**：做题时答不出来 → **手动回讲解**（用户原话「答题答不出来的时候允许回到讲解」）。
+
+        口径（与"答错两次自动回炉"是**两件事**，那条路一个字没动）：
+
+        - 回讲解，且**讲解完整显示**（与"没看过讲解"时同一条路：不带 `lecture_cache` 的缩略块语义）；
+        - `practice.attempts_this = 0`（回炉＝重新学一遍，**不偷偷少一次机会**）；
+        - **不动** `streak` / `streak_min` / `issued` / `excluded`（**这不是答错**）；
+        - **不写任何账本**（不扣分、不记 attempts）；
+        - **幂等**：连点两次只是再回一次讲解，不报错。
+        """
+        flow = _ensure_flow_shape(sess.flow_json)
+        flow["practice"]["attempts_this"] = 0        # 重新学一遍，机会不减少
+        # 当前这题**留着**（不清 current、不动 issued/excluded/streak）—— 用户做了一半的东西不许丢
+        sess.flow_json = flow
+        return self._rewind_to_explain(db, sess, REWIND_EXPLAIN_ZH)
 
     def _act_regen_explain(self, db: Session, sess: models.Session, node: NodeDoc, payload: dict[str, Any]) -> dict[str, Any]:
         """R8 清理路径：清掉缓存的（可能脏的）讲解，回到 explain 阶段重新生成。"""

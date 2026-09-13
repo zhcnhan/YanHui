@@ -141,6 +141,8 @@ def exercises(provider, ctx: ModeExerciseIn, *, subject_id: str = "", unit_id: s
         "unit_title": ctx.unit_title, "key_points": ctx.key_points,
         "want_count": str(ctx.want_count), "exercise_kind": ctx.kind,
         "asked_before": ctx.asked_before, "pages_digest": _digest(pages or ctx.pages_digest),
+        # **R77 补充**：上一轮被判"没营养"的原因回灌（空表＝首次出题）
+        "errors_block": ctx.errors,
     })
     return ModeExerciseOut(**_call(provider, CALL_MODE_EXERCISE, system, user, ver,
                                    subject_id=subject_id, unit_id=unit_id).parsed)

@@ -25,6 +25,138 @@ from . import mode_pages
 MAX_AI_EXERCISES = 6
 
 
+# ---------------------------------------------------------------------------
+# **R77 补充**：拦掉"没营养的题"——机器兜底（提示词拦不住时最后一道闸）
+#
+# 一句话判据（用户那道"目录里『艮宫属土』后标的页码是几"的题就是反例）：
+#   **换成同主题的另一本书就答不出来的题，考的是「这本书」，不是「这门手艺」。**
+#
+# ⚠️ 判得**窄而准**：教材正文里本来就会出现「页/图/表」这些字
+# （如「这一页讲的用神有哪几种」），**不许见到「页」字就砍**。
+# 所以每一条判据都要求"问的是页码/书物**本身**"，并且用例里配了阳性对照。
+# ---------------------------------------------------------------------------
+# ① 题干在问"书本身"的东西（页码/目录/凡例/版本/出版/版式/卷次…）
+_ASK_BOOK_THING = re.compile(
+    r"(页码|第\s*[0-9一二三四五六七八九十百千零〇两]+\s*页|第几页|哪一页|在哪一页|页数|页眉|页脚"
+    r"|版式|排版|字号|字体|版面|装帧|插图|表格"
+    r"|目录|篇目|凡例|体例|编例"
+    r"|版本|第几版|辑者|谁辑|注本|出版社|成书|校勘|刻本|影印"
+    r"|第几卷|第几章|第几篇|卷次|哪一卷|第几册)")
+# ② 题干里出现了"页码/目录/卷次"这类线索（用来给答案判据兜底，避免误伤纯数值题）
+_PAGE_HINT = re.compile(
+    r"(页码|第\s*[0-9一二三四五六七八九十百千零〇两]+\s*页|第几页|哪一页|在哪一页"
+    r"|目录|篇目|卷次|第几卷|第几章|第几篇)")
+# ③ 答案**本身就只是**一个页码/卷次（纯数字或中文数字，可带"页/卷/章/篇/册"）
+_NUMERAL_ANSWER = re.compile(
+    r"^[0-9一二三四五六七八九十百千零〇两壹贰叁肆伍陆柒捌玖拾]+\s*[页卷篇章册]?$")
+
+
+def low_value_reasons(*, prompt: str, answer: str, basis_pages: list[str] | None = None,
+                      front_pages: set[str] | None = None) -> list[str]:
+    """这道题"没营养"的原因（**空表＝过关**）。判据三类，宁可漏判也不误伤。
+
+    ① 题干在问**页码/目录/凡例/版本/出版/版式/卷次**这类"书本身"的东西；
+    ② 题干有页码/目录线索、而**答案本身就是**页码/卷次（纯数字或中文数字）；
+    ③ 这道题依据的页**全都**落在**前置章**里（目录页/凡例页/书名页…）——
+       与 R77 的前置章判定**共用口径**（`meta.front_matter` 覆盖到的页），这些页不该出题。
+    """
+    text = str(prompt or "").strip()
+    ans = str(answer or "").strip()
+    reasons: list[str] = []
+    hit = _ASK_BOOK_THING.search(text)
+    if hit:
+        reasons.append(f"问的是「{hit.group(1)}」这类书本身的东西（换一本书就答不出来）")
+    if _PAGE_HINT.search(text) and _NUMERAL_ANSWER.match(ans):
+        reasons.append(f"答案是页码/卷次这类元信息（{ans[:12]}）")
+    pages = [str(p).strip() for p in (basis_pages or []) if str(p).strip()]
+    if front_pages and pages and all(p in front_pages for p in pages):
+        reasons.append("依据的页是前置内容（目录/凡例/书名页这类），这些页不该出题")
+    return reasons
+
+
+def _front_matter_page_labels(db, subject_id: str) -> set[str]:
+    """被**前置章**覆盖的页标签（目录页/凡例页/书名页…）——与 R77 的前置章判定共用口径。"""
+    from . import store as ostore
+
+    out: set[str] = set()
+    try:
+        doc = ostore.get_outline(subject_id)
+    except Exception:
+        return out
+    if doc is None:
+        return out
+    for u in doc.units:
+        if not bool((getattr(u, "meta", None) or {}).get("front_matter")):
+            continue
+        try:
+            st = mode_pages.unit_page_state(db, subject_id, u)
+        except Exception:
+            continue
+        out |= {str(x) for x in (st.get("refs") or [])}
+    return out
+
+
+def _screen_exercises(items, *, front_pages: set[str] | None = None) -> tuple[list, list[dict]]:
+    """逐题过筛 → ``(留下的, 被剔除的〔带中文原因〕)``。"""
+    keep: list = []
+    dropped: list[dict] = []
+    for e in items or []:
+        reasons = low_value_reasons(prompt=str(getattr(e, "prompt", "") or ""),
+                                    answer=str(getattr(e, "answer", "") or ""),
+                                    basis_pages=list(getattr(e, "basis_pages", None) or []),
+                                    front_pages=front_pages)
+        if reasons:
+            dropped.append({"prompt": str(getattr(e, "prompt", "") or "")[:100],
+                            "answer": str(getattr(e, "answer", "") or "")[:24],
+                            "basis_pages": [str(p) for p in (getattr(e, "basis_pages", None) or [])][:6],
+                            "reasons": reasons})
+        else:
+            keep.append(e)
+    return keep, dropped
+
+
+def _generate_screened_exercises(db, provider, *, unit, lesson, pages, subject_id: str,
+                                 want: int) -> tuple[object, list[dict]]:
+    """出题 → **过筛** → 返回 ``(exercises, 被剔除的题〔带原因〕)``。
+
+    流程（工单 §2）：**先驳回重生成一次**（把命中的具体原因回灌给模型，要求换一道）；
+    重生成后还有 → **剔除该题**（并如实记账）。**好题一道不丢**（两轮的合格题合并，按题面去重）。
+    """
+    from ..ai.calls import ModeExerciseOut
+    from ..service import ledger
+
+    front_pages = _front_matter_page_labels(db, subject_id)
+    out = mode_ai.exercises(provider, ModeExerciseIn(
+        unit_title=unit.title, key_points=list(lesson.key_points or []), pages_digest=pages,
+        want_count=want, kind="practice"), subject_id=subject_id, unit_id=unit.id)
+    keep, dropped = _screen_exercises(out.exercises or [], front_pages=front_pages)
+    if not dropped:
+        return out, []
+    why = [f"这道题不要出：「{d['prompt']}」——原因：{'；'.join(d['reasons'])}" for d in dropped]
+    retry = mode_ai.exercises(provider, ModeExerciseIn(
+        unit_title=unit.title, key_points=list(lesson.key_points or []), pages_digest=pages,
+        want_count=want, kind="practice",
+        asked_before=[str(getattr(x, "prompt", "") or "")[:80] for x in (out.exercises or [])],
+        errors=why), subject_id=subject_id, unit_id=unit.id)
+    keep2, dropped2 = _screen_exercises(retry.exercises or [], front_pages=front_pages)
+    seen = {str(getattr(x, "prompt", "") or "") for x in keep}
+    merged = keep + [x for x in keep2 if str(getattr(x, "prompt", "") or "") not in seen]
+    report = list({d["prompt"]: d for d in (dropped + dropped2)}.values())   # 按题面去重
+    ledger.note(ledger.CAT_GENERATION, f"单元内容（{unit.id}）· 没营养的题",
+                f"剔除了 {len(report)} 道没营养的题（问页码/目录/版本/版式这类「书本身」的东西）——"
+                "这些题换一本书就答不出来，考的不是这门手艺。"
+                "已经先让模型换了一道，仍然不行的就没收进来；原因逐条在细节里。",
+                impact=ledger.SCOPE_UNIT, remedy=ledger.REMEDY_YES, subject_id=subject_id,
+                unit_id=unit.id,
+                detail={"kind": "mode_low_value_exercises_dropped", "count": len(report),
+                        "dropped": report[:10], "first_pass_dropped": len(dropped),
+                        "regenerated": True})
+    return (ModeExerciseOut(exercises=merged[:want],
+                            uncertain=bool(getattr(retry, "uncertain", False)),
+                            uncertain_reason=str(getattr(retry, "uncertain_reason", "") or "")),
+            report)
+
+
 def draft_mode_outline(db, subject_id: str, *, brief: str = "", count: int = 0, provider=None,
                        provider_factory=None) -> dict:
     """**R57 任务 B-①**：图示教材模式的**一键起草大纲**（走 `mode_outline`）。
@@ -244,10 +376,14 @@ def generate_mode_unit(db, subject_id: str, unit, *, provider=None, want_count: 
         subject_id=subject_id, unit_id=unit.id)
     # **R77 前置章**：讲解**照旧生成**（用户明确要的），但**不出题**——不调 mode_exercise。
     front = bool((getattr(unit, "meta", None) or {}).get("front_matter"))
-    exercises = None if front else mode_ai.exercises(provider, ModeExerciseIn(
-        unit_title=unit.title, key_points=list(lesson.key_points or []), pages_digest=pages,
-        want_count=max(1, min(want_count, MAX_AI_EXERCISES)), kind="practice"),
-        subject_id=subject_id, unit_id=unit.id)
+    want = max(1, min(want_count, MAX_AI_EXERCISES))
+    low_value: list[dict] = []
+    if front:
+        exercises = None
+    else:
+        # **R77 补充**：出题之后、入库之前过一道"没营养题"筛子（先驳回重生成一次，仍不行就剔除并记账）
+        exercises, low_value = _generate_screened_exercises(
+            db, provider, unit=unit, lesson=lesson, pages=pages, subject_id=subject_id, want=want)
 
     doc = _to_node_doc(subject_id, unit, lesson, exercises)
     path = _write_node(doc)
@@ -259,17 +395,49 @@ def generate_mode_unit(db, subject_id: str, unit, *, provider=None, want_count: 
     if not out.ok:
         return {"status": "failed", "node_id": unit.id, "path": str(path),
                 "note": "；".join(out.errors[:3])}
+    if low_value:
+        _record_low_value_dropped(db, subject_id, unit, low_value)
     return {"status": "created", "node_id": unit.id, "path": str(path),
             "note": ((f"出稿：全 AI 模式（前置章：只出讲解，不出题）"
                       if front else
                       f"出稿：全 AI 模式（模型写讲解 + 出题，共 {len(doc.exercises)} 题）")
                      + "；这个模式没有独立的第二次核对"
+                     + (f"；**剔除了 {len(low_value)} 道没营养的题**"
+                        "（问页码/目录/版本/版式这类「书本身」的东西，换本书就答不出来）"
+                        if low_value else "")
                      + ("；" + note_zh if note_zh else "")),
             "front_matter": bool(doc.front_matter),
+            "low_value_dropped": len(low_value),
             "source_pages": list(lesson.source_pages or []),
             "read_pages": state["read"], "unread_pages": state["unread"],
             "lesson_uncertain": bool(lesson.uncertain),
             "exercise_uncertain": bool(getattr(exercises, "uncertain", False))}
+
+
+def _record_low_value_dropped(db, subject_id: str, unit, dropped: list[dict]) -> None:
+    """把"剔了几道没营养的题"并进单元覆盖记录 —— 界面与账本据此**如实说**（不许静默）。
+
+    与 `_record_reason` 的区别：这里**合并**进已有的 coverage（不覆盖掉覆盖状态那些键）。
+    """
+    try:
+        from . import store as ostore
+
+        doc = ostore.get_outline(subject_id)
+        if doc is None:
+            return
+        target = doc.by_id().get(unit.id)
+        if target is None:
+            return
+        meta = dict(target.meta or {})
+        cov = dict(meta.get("coverage") or {})
+        cov["low_value_dropped"] = int(cov.get("low_value_dropped") or 0) + len(dropped)
+        cov["low_value_note_zh"] = ("这些题问的是页码/目录/版本/版式这类「书本身」的东西，"
+                                   "换一本书就答不出来——已剔除，没让它进你的练习。")
+        meta["coverage"] = cov
+        target.meta = meta
+        ostore.save_outline(subject_id, doc)
+    except Exception:
+        pass          # 覆盖记录是"如实说"的增强，失败不影响出稿本身
 
 
 def _record_reason(db, subject_id: str, unit, note: str) -> None:
